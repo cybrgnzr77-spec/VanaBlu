@@ -6,12 +6,6 @@
 
 local M = {}
 
-M.gift_exempt_traits = {
-    ['Double/Triple Attack']      = true,
-    ['Auto Refresh']              = true,
-    ['Gilfinder/TH']              = true,
-    ['Gilfinder/Treasure Hunter'] = true,
-}
 
 --- Computes BLU slot / set point (BP) / gift limits.
 -- Set point maximum (matches LandSandBoat blueutils::GetTotalBlueMagicPoints):
@@ -64,13 +58,10 @@ function M.get_limits(level, is_main, assimilation_points, blue_point_bonus, jp_
         points_source = 'client'
     end
 
-    -- Level 99 Job Point gift tier bonuses (+1 at 100 JP, +2 at 1200 JP)
-    if level == 99 then
-        if jp_spent >= 1200 then
-            gifts = 2
-        elseif jp_spent >= 100 then
-            gifts = 1
-        end
+    -- Job Point gift "Job Trait Bonus" (LandSandBoat job_point_gifts: BLU, 100 JP): +1 trait tier.
+    -- Applied by the server only when the MAIN job is BLU at level 99 with 100+ JP spent on BLU.
+    if level == 99 and is_main and jp_spent >= 100 then
+        gifts = 1
     end
 
     slots = math.min(20, math.max(0, slots))
@@ -166,8 +157,17 @@ function M.validate_action(spell_id, equipped_state, limits, spellinfo, is_learn
     return true, { action = 'set', slot = free_slot, spell_id = spell_id, cost = sinfo.cost or 0 }
 end
 
-function M.evaluate_trait(trait, equipped_map, gifts)
-    gifts = gifts or 0
+--- Evaluates one Blue Magic job trait the way the server does (LandSandBoat blueutils::CalculateTraits).
+-- 1. Total the `points` of every equipped spell in the trait.
+-- 2. The active tier is the highest-rank tier whose `points` requirement is met, ignoring jp_only tiers.
+-- 3. The Job Point gift (+1 tier) then raises it to the highest tier with rank <= active rank + bonus,
+--    including jp_only tiers. This is also how Double Attack becomes Triple Attack and Gilfinder becomes
+--    Treasure Hunter (both are a single trait line on the server).
+-- @param trait table entry from res/traits.lua
+-- @param equipped_map table [spell_id] = truthy
+-- @param bonus number tier bonus from the Job Point gift (0 or 1)
+function M.evaluate_trait(trait, equipped_map, bonus)
+    bonus = bonus or 0
     local total_points = 0
     local equipped_spells = {}
     local unequipped_spells = {}
@@ -181,49 +181,54 @@ function M.evaluate_trait(trait, equipped_map, gifts)
         end
     end
 
-    if not trait.sorted_tiers then
-        local thresholds = {}
-        for req, val in pairs(trait.tiers) do
-            table.insert(thresholds, { required = req, value = val })
-        end
-        table.sort(thresholds, function(a, b) return a.required < b.required end)
-        trait.sorted_tiers = thresholds
-    end
-    local thresholds = trait.sorted_tiers
+    local tiers = trait.tiers or {}
 
-    local active_index = 0
-    local active_val = nil
-    for idx, t in ipairs(thresholds) do
-        if total_points >= t.required then
-            active_index = idx
-            active_val = t.value
+    local base_index = 0
+    for idx, t in ipairs(tiers) do
+        if not t.jp_only and total_points >= t.points then
+            if base_index == 0 or t.rank >= tiers[base_index].rank then
+                base_index = idx
+            end
         end
     end
 
-    if active_index > 0 and gifts > 0 and not M.gift_exempt_traits[trait.name] then
-        active_index = math.min(#thresholds, active_index + gifts)
-        active_val = thresholds[active_index].value
+    local active_index = base_index
+    local boosted = false
+    if base_index > 0 and bonus > 0 then
+        local target_rank = tiers[base_index].rank + bonus
+        for idx, t in ipairs(tiers) do
+            if t.rank <= target_rank and t.rank > tiers[active_index].rank then
+                active_index = idx
+                boosted = true
+            end
+        end
     end
 
-    local next_req = nil
-    local points_needed = nil
-    if active_index < #thresholds then
-        next_req = thresholds[active_index + 1].required
-        points_needed = next_req - total_points
+    -- Next tier reachable by adding spells (jp_only tiers can't be reached with points alone)
+    local next_req, points_needed = nil, nil
+    for _, t in ipairs(tiers) do
+        if not t.jp_only and t.points > total_points then
+            next_req = t.points
+            points_needed = t.points - total_points
+            break
+        end
     end
 
+    local active = tiers[active_index]
     return {
         name = trait.name,
         current_points = total_points,
         active_tier_index = active_index,
-        active_tier_val = active_val,
+        active_tier_val = active and active.text or nil,
         is_active = (active_index > 0),
+        boosted = boosted,
+        retail = trait.retail == true,
         next_threshold = next_req,
         points_needed = points_needed,
         equipped_spells = equipped_spells,
         unequipped_spells = unequipped_spells,
         all_spells = trait.spells,
-        tiers = thresholds,
+        tiers = tiers,
         subs = trait.subs or {}
     }
 end

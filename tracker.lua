@@ -150,8 +150,15 @@ function M.build(hunting, spellinfo)
             end
             local cost_text = e.unbridled and 'Unbridled Learning spell (cannot be set)'
                 or string.format('Set Cost: %d BP', e.cost or 0);
+            local elem_name = (sp and sp.element_name) or ELEMENT_NAMES[e.element] or 'Unknown';
             e.summary = string.format('Level: %d   |   %s   |   Element: %s   |   Family: %s',
-                e.level, cost_text, ELEMENT_NAMES[e.element] or 'Unknown', e.family);
+                e.level, cost_text, elem_name, e.family);
+            if sp and sp.noscript then
+                local notes = {};
+                for _, n in ipairs(e.notes) do notes[#notes + 1] = n; end
+                notes[#notes + 1] = 'The public server code has no cast script for this spell, so casting it may do nothing; it still counts for traits and stats.';
+                e.notes = notes;
+            end
             if e.unbridled then
                 e.attributes = nil;
             else

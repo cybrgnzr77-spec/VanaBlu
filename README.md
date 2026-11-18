@@ -1,4 +1,4 @@
-# VanaBlu for Ashita v4 (v1.0.1)
+# VanaBlu for Ashita v4 (v1.0.2)
 
 **VanaBlu** is a comprehensive, interactive Blue Magic spell, job trait, skillchain, and spell-hunting guide for Final Fantasy XI, built natively for **Ashita v4**.
 
@@ -32,6 +32,21 @@ Evolved from the original Windower 4 `bluGuide` addon by **Anissa**, VanaBlu has
 ---
 
 ## Changelog
+
+### v1.0.2
+Spell and trait data audited against the server code (LandSandBoat) and retail client data:
+- **Job traits rebuilt from the server's trait tables.** Trait points now use the server scale (most spells 1 point, level-99 spells 2). Tier thresholds and values follow the server. Several traits had the wrong number of tiers, e.g. Zanshin has one tier, Beast Killer three, and Max MP Boost tops out at +20. Gilfinder needs 2 points and Treasure Hunter 3.
+- **Job Point trait bonus corrected:** +1 tier at main-job level 99 with 100+ JP spent. There is no +2 at 1200 JP. The bonus applies to every trait, can reach the tiers marked "JP", and upgrades Double Attack to Triple Attack and Gilfinder to Treasure Hunter, matching the server.
+- **Retail-only trait data marked.** Six traits (Critical Attack Bonus, Inquartata, Magic Accuracy Bonus, Magic Evasion Bonus, Resist Silence, Tenacity) and the level-99 spells' trait points are not in the public server code. They are kept, converted from retail values, and marked as unconfirmed.
+- **Spell fixes:** the following now match the server and retail data.
+  - Elements: buff and cure spells such as Pollen, Cocoon and Refueling have no element, and they now show "[None]" instead of an element. Seedspray is Earth.
+  - Skillchains: Dimensional Death (Transfixion/Impaction), Goblin Rush (Fusion/Impaction), Amorphic Spikes (Gravitation only).
+  - Effects: Cursed Sphere is water damage with no poison (now listed as a nuke). Sandspray inflicts Blind. Exuviation also cures. Auroral Drape inflicts Silence + Bind on this server. Hydro Shot has no Enmity Down.
+  - Abyssea procs: only the 8 spells the server uses (Bad Breath and Temporal Shift removed). Voidwatch is labelled as retail reference, since the server code doesn't implement it.
+- **Level and set-point costs verified:** all 178 spells match both the server and retail, so no changes were needed.
+- **Spells without a cast script flagged:** 49 spells (mostly level 77+) have no cast script in the public server code. Their tooltip and tracker entry now say so. They still give traits and stat bonuses when set.
+- **Damage tab:** the Liquefaction skillchain list was always empty because of a spelling mismatch. It's fixed.
+- **Unbridled Learning spells:** Spell Tracker levels for Droning Whirlwind, Carcharian Verve and Blistering Roar corrected to 99.
 
 ### v1.0.1
 - **Fixed:** Maximum Blue Magic Set Points stopped at 60 for level 99 characters. The Blue Magic Point Bonus job points (up to +20 BP) were never read, because the Ashita v4 call the addon relied on does not exist. The maximum (up to 80 BP: 55 base + 5 Assimilation merits + 20 job points) is now read directly from the game client, the same value the in-game Set Blue Magic menu shows. If that value is unavailable, the job point rank is captured from the server's job point packet (`0x08D`) instead.

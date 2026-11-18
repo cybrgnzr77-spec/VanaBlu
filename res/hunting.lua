@@ -9719,7 +9719,7 @@ return {
         },
     },
     [744] = {
-        name = "Droning Whirlwind", level = 96, element = 2, skill = 374,
+        name = "Droning Whirlwind", level = 99, element = 2, skill = 395,
         family = "Bztavian", stats = "None", stats_verified = true,
         status = "ok", unbridled = true,
         notes = { },
@@ -9734,7 +9734,7 @@ return {
         },
     },
     [745] = {
-        name = "Carcharian Verve", level = 96, element = 5, skill = 374,
+        name = "Carcharian Verve", level = 99, element = 5, skill = 395,
         family = "Rockfin", stats = "None", stats_verified = true,
         status = "ok", unbridled = true,
         notes = { },
@@ -9749,7 +9749,7 @@ return {
         },
     },
     [746] = {
-        name = "Blistering Roar", level = 96, element = 7, skill = 374,
+        name = "Blistering Roar", level = 99, element = 7, skill = 395,
         family = "Rockfin", stats = "None", stats_verified = true,
         status = "ok", unbridled = true,
         notes = { },
@@ -9764,7 +9764,7 @@ return {
         },
     },
     [747] = {
-        name = "Uproot", level = 99, element = nil, skill = 395,
+        name = "Uproot", level = 99, element = 6, skill = 395,
         family = "Yggdreant", stats = "None", stats_verified = true,
         status = "ok", unbridled = true,
         notes = { },
@@ -9779,7 +9779,7 @@ return {
         },
     },
     [748] = {
-        name = "Crashing Thunder", level = 99, element = nil, skill = 395,
+        name = "Crashing Thunder", level = 99, element = 4, skill = 395,
         family = "Waktza", stats = "None", stats_verified = true,
         status = "ok", unbridled = true,
         notes = { },
@@ -9794,7 +9794,7 @@ return {
         },
     },
     [749] = {
-        name = "Polar Roar", level = 99, element = nil, skill = 395,
+        name = "Polar Roar", level = 99, element = 1, skill = 395,
         family = "Cehuetzi", stats = "None", stats_verified = true,
         status = "ok", unbridled = true,
         notes = { },
@@ -9809,7 +9809,7 @@ return {
         },
     },
     [750] = {
-        name = "Mighty Guard", level = 99, element = nil, skill = 395,
+        name = "Mighty Guard", level = 99, element = 6, skill = 395,
         family = "Shinryu", stats = "None", stats_verified = true,
         status = "ok", unbridled = true,
         notes = { },
@@ -9824,7 +9824,7 @@ return {
         },
     },
     [751] = {
-        name = "Cruel Joke", level = 99, element = nil, skill = 395,
+        name = "Cruel Joke", level = 99, element = 7, skill = 395,
         family = "Unknown", stats = "None", stats_verified = true,
         status = "ok", unbridled = true,
         notes = { },
@@ -9839,7 +9839,7 @@ return {
         },
     },
     [752] = {
-        name = "Cesspool", level = 99, element = nil, skill = 395,
+        name = "Cesspool", level = 99, element = 5, skill = 395,
         family = "Unknown", stats = "None", stats_verified = true,
         status = "ok", unbridled = true,
         notes = { },
@@ -9851,7 +9851,7 @@ return {
         },
     },
     [753] = {
-        name = "Tearing Gust", level = 99, element = nil, skill = 395,
+        name = "Tearing Gust", level = 99, element = 2, skill = 395,
         family = "Unknown", stats = "None", stats_verified = true,
         status = "ok", unbridled = true,
         notes = { "VanaDreams maps this to skill list 'Ashrakk', whose monsters are unknown; the retail source is shown instead.", },

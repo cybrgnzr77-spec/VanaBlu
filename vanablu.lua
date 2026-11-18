@@ -23,7 +23,7 @@
 
 addon.name    = 'vanablu';
 addon.author  = 'Anissa (original bluGuide) / Ashita v4 port & VanaBlu enhancements';
-addon.version = '1.0.1';
+addon.version = '1.0.2';
 addon.desc    = 'Interactive Blue Magic spell, trait, skillchain, and hunting guide for Ashita v4.';
 addon.link    = 'https://github.com/mverteuil/windower4-addons/tree/master/vanablu';
 
@@ -269,7 +269,7 @@ local skillchain_categories = {
     { name = 'Reverberation', sc = 'Reverberation' },
     { name = 'Induration',    sc = 'Induration' },
     { name = 'Impaction',     sc = 'Impaction' },
-    { name = 'Liquefaction',  sc = 'Liquifaction' },
+    { name = 'Liquefaction',  sc = 'Liquefaction' },
     { name = 'Detonation',    sc = 'Detonation' },
     { name = 'Scission',      sc = 'Scission' },
 };
@@ -310,6 +310,7 @@ local ELEMENT_COLORS = {
     [6]  = { 0.98, 0.98, 1.0, 1.0 }, -- Light (White)
     [7]  = { 0.70, 0.70, 0.75, 1.0 }, -- Dark (Grey)
     [15] = { 0.95, 0.65, 0.25, 1.0 }, -- Physical (Orange)
+    [16] = { 0.80, 0.80, 0.80, 1.0 }, -- No element (Light grey)
 };
 
 local ELEMENT_NAMES = {
@@ -373,7 +374,13 @@ local function initialize_data()
     -- Precompute per-spell labels, contexts, and tracker strings to eliminate per-frame allocations
     for _, sp in ipairs(ordered_spells) do
         sp.default_label = string.format('%-20s (Lv.%-2d | %d BP)', sp.name, sp.level, sp.cost or 0);
-        sp.elem_tag = ELEMENT_TAGS[sp.element] or '[???]';
+        if sp.physical then
+            sp.elem_tag, sp.element_name, sp.elem_key = '[Phys]', 'Physical', 15;
+        elseif sp.element == 15 then
+            sp.elem_tag, sp.element_name, sp.elem_key = '[None]', 'None', 16;
+        else
+            sp.elem_tag, sp.element_name, sp.elem_key = ELEMENT_TAGS[sp.element] or '[???]', ELEMENT_NAMES[sp.element] or 'Unknown', sp.element;
+        end
         sp.all_ctx = 'all_' .. sp.id;
         sp.id_str = tostring(sp.id);
 
@@ -426,6 +433,9 @@ local function initialize_data()
             sp.tracker_procs = nil;
             sp.tip_proc_text = '';
         end
+
+        -- Spells with no cast script in the public server code (effect on cast is unconfirmed)
+        sp.tip_noscript_text = sp.noscript and '\nServer note: no cast script in the public server code - casting it may do nothing.\nIt still counts for job traits and stat bonuses.' or '';
 
     end
 
@@ -492,8 +502,9 @@ local function initialize_data()
         if tr.spells then
             for _, sp_ref in ipairs(tr.spells) do
                 local full_sp = spells[sp_ref.id];
-                sp_ref.row_label = string.format('%-18s [Trait: +%d pts | Cost: %d BP | Lv.%d]',
-                    sp_ref.name, sp_ref.points or 0, sp_ref.cost or (full_sp and full_sp.cost) or 0, (full_sp and full_sp.level) or 1);
+                sp_ref.row_label = string.format('%-18s [Trait: +%d pts | Cost: %d BP | Lv.%d]%s',
+                    sp_ref.name, sp_ref.points or 0, sp_ref.cost or (full_sp and full_sp.cost) or 0, (full_sp and full_sp.level) or 1,
+                    sp_ref.retail and '  (retail value, unconfirmed)' or '');
                 sp_ref.row_ctx = 'tr_' .. tr.name .. '_' .. sp_ref.id;
             end
         end
@@ -668,14 +679,14 @@ local function render_spell_tooltip(sp, is_learned, is_equipped)
     local tip = string.format(
         '%s\n--------------------\nElement: %s  |  Level: %d  |  Cost: %d BP\nStatus: %s  |  Learned: %s%s%s%s\n--------------------\nClick button to equip or unequip.',
         sp.name,
-        ELEMENT_NAMES[sp.element] or 'Unknown',
+        sp.element_name or 'Unknown',
         sp.level,
         sp.cost or 0,
         is_equipped and 'Equipped' or 'Not Equipped',
         is_learned and 'Yes' or 'No',
         sp.tip_sc_text or '',
         sp.tip_eff_text or '',
-        sp.tip_proc_text or ''
+        (sp.tip_proc_text or '') .. (sp.tip_noscript_text or '')
     );
 
     pcall(function() imgui.SetTooltip(tip); end);
@@ -688,7 +699,7 @@ local function render_spell_row(sp, equipped_state, limits, learned_map, is_main
 
     local is_equipped = (equipped_state.map[sp.id] ~= nil);
     local is_learned = (learned_map[sp.id] == true);
-    local col = ELEMENT_COLORS[sp.element] or { 1.0, 1.0, 1.0, 1.0 };
+    local col = ELEMENT_COLORS[sp.elem_key or sp.element] or { 1.0, 1.0, 1.0, 1.0 };
 
     local btn_label = is_equipped and '[-]##btn' or '[+]##btn';
     if safe_button(btn_label, 26, 20) then
@@ -739,21 +750,28 @@ local function render_traits_view(equipped_state, limits, learned_map, is_main)
         if imgui.CollapsingHeader(title) then
             imgui.Indent(14);
 
-            -- Tiers summary
+            if eval.retail then
+                safe_text_colored(1.0, 0.75, 0.3, 1.0, 'This trait is not in the public server code: tiers are converted from retail and may not apply on this server.');
+            end
+
+            -- Tiers summary (active tier in brackets; JP = only reachable through the Job Point gift)
             local tier_items = {};
-            for _, t in ipairs(eval.tiers) do
-                local tag = string.format('%d pts: %s', t.required, tostring(t.value));
-                if eval.current_points >= t.required then
+            for idx, t in ipairs(eval.tiers) do
+                local tag = t.jp_only and string.format('JP: %s', t.text) or string.format('%d pts: %s', t.points, t.text);
+                if idx == eval.active_tier_index then
                     tag = '[' .. tag .. ']';
                 end
                 table.insert(tier_items, tag);
             end
             safe_text_colored(0.8, 0.85, 0.95, 1.0, 'Tiers: ' .. table.concat(tier_items, '  ->  '));
+            if eval.boosted then
+                safe_text_colored(0.4, 1.0, 0.4, 1.0, 'Raised one tier by the Job Point gift (Lv.99 BLU with 100+ JP spent).');
+            end
 
             if eval.points_needed then
                 safe_text_colored(0.4, 0.8, 1.0, 1.0, string.format('Next Tier: %d pts needed (%d/%d)', eval.points_needed, eval.current_points, eval.next_threshold));
             else
-                safe_text_colored(0.4, 1.0, 0.4, 1.0, 'Max Blue Magic Trait Tier Reached!');
+                safe_text_colored(0.4, 1.0, 0.4, 1.0, 'Highest tier reachable with spell points reached.');
             end
 
             imgui.Spacing();
@@ -841,7 +859,7 @@ end
 
 --- Tab 4: Weakness Procs
 local function render_procs_view(equipped_state, limits, learned_map, is_main)
-    imgui.TextDisabled('Blue Magic spells commonly used for Voidwatch weaknesses and Abyssea triggers.');
+    imgui.TextDisabled('Abyssea: spells that trigger yellow (magic) weaknesses on this server. Voidwatch: retail reference only (not in the server code).');
     imgui.Separator();
 
     for _, cat in ipairs(proc_categories) do
@@ -1433,9 +1451,10 @@ local function render_help_view()
     imgui.Spacing();
     imgui.Text('Job Traits & Gifts:');
     safe_bullet_text('Traits automatically update in real-time as spells are equipped or unequipped.');
-    safe_bullet_text('At level 99 with 100 Job Points spent, eligible traits receive a +1 Tier Gift bonus.');
-    safe_bullet_text('At level 99 with 1200 Job Points spent, eligible traits receive a +2 Tier Gift bonus.');
-    safe_bullet_text('Exempt traits (Double/Triple Attack, Auto Refresh, Gilfinder/TH) do not receive gift tiers.');
+    safe_bullet_text('Trait points follow the server: most spells add 1 point and level-99 spells add 2. Tiers unlock at the listed point totals.');
+    safe_bullet_text('Main-job BLU at level 99 with 100+ Job Points spent gets +1 tier on every active trait (Job Point gift).');
+    safe_bullet_text('That bonus can reach tiers marked "JP" and turns Double Attack into Triple Attack and Gilfinder into Treasure Hunter.');
+    safe_bullet_text('Traits or spells marked "retail" are not in the public server code and may not apply on this server.');
 end
 
 -- =============================================================================
@@ -1506,7 +1525,7 @@ local function render_equipped_sidebar(equipped_state, limits, learned_map, is_m
         local sp_id = equipped_state.slots[slot];
         if sp_id and sp_id > 0 and spells[sp_id] then
             local sp = spells[sp_id];
-            local col = ELEMENT_COLORS[sp.element] or { 1.0, 1.0, 1.0, 1.0 };
+            local col = ELEMENT_COLORS[sp.elem_key or sp.element] or { 1.0, 1.0, 1.0, 1.0 };
 
             if safe_button('[X]##eq_btn', 24, 18) then
                 handle_spell_click(sp.id, equipped_state, limits, learned_map, is_main);

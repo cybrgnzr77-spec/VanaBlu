@@ -1,7 +1,9 @@
 --[[
 * VanaBlu for Ashita v4
-* Core Domain Model and Calculations
-* Ported from Windower 4 bluGuide by Anissa / VanaBlu for Ashita v4
+* Module: model.lua
+* Blue Magic rules with no game client access: slot/set point limits, equipped-spell
+* bookkeeping, equip validation, job trait tiers and saved-set helpers.
+* Original bluGuide (Windower 4) by Anissa of Cerberus.
 --]]
 
 local M = {}
@@ -82,6 +84,10 @@ function M.get_limits(level, is_main, assimilation_points, blue_point_bonus, jp_
     }
 end
 
+--- Converts the 20 raw spell bytes from client memory into lookup tables.
+-- @param raw_array table 20 spell bytes (spell id - 512; 0 = empty slot)
+-- @param spellinfo table res/spellinfo.lua
+-- @return table { map = [spell_id] = slot, slots = [slot] = spell_id, count = n, points_spent = BP }
 function M.process_equipped(raw_array, spellinfo)
     local equipped_map = {}
     local equipped_slots = {}
@@ -100,8 +106,6 @@ function M.process_equipped(raw_array, spellinfo)
             if sinfo and sinfo.cost then
                 points_spent = points_spent + sinfo.cost
             end
-        else
-            equipped_slots[slot] = nil
         end
     end
 
@@ -113,6 +117,7 @@ function M.process_equipped(raw_array, spellinfo)
     }
 end
 
+--- Returns the first empty slot number (1..max_slots), or nil if all are used.
 function M.find_free_slot(equipped_slots, max_slots)
     for slot = 1, max_slots do
         if not equipped_slots[slot] or equipped_slots[slot] == 0 then
@@ -122,6 +127,10 @@ function M.find_free_slot(equipped_slots, max_slots)
     return nil
 end
 
+--- Decides what clicking a spell should do: remove it if equipped, otherwise set it in the first
+-- free slot if it is learned, the level allows it, and a slot and enough set points are free.
+-- @param is_learned boolean|nil false blocks equipping; nil (unknown) does not
+-- @return boolean ok, table|nil { action = 'remove'|'set', slot, spell_id[, cost] }, string|nil error
 function M.validate_action(spell_id, equipped_state, limits, spellinfo, is_learned)
     local sinfo = spellinfo[spell_id]
     if not sinfo then
@@ -273,11 +282,13 @@ function M.get_set_traits(spell_ids, traits_table, gifts)
     return active_traits;
 end
 
---- Generates sequential actions to transform currently equipped spells into target_spell_ids.
--- Follows blusets safe slot management:
--- 1. Unsets any currently equipped slot whose spell does not match the target spell for that exact slot.
--- 2. Sets the desired target spells into their respective slots.
--- Ensures zero slot collisions, zero duplicate spell rejections, and retains matching spells.
+--- Lists the per-slot changes that would turn the equipped spells into target_spell_ids
+-- (slot N of the result holds target_spell_ids[N]):
+-- 1. 'remove' for every occupied slot whose spell differs from the target for that slot.
+-- 2. 'set' for every target spell not already in its slot.
+-- Removals come first so a spell that only moves slots is never set twice at once.
+-- VanaBlu currently uses this only to detect a set that is already equipped (empty result);
+-- loading a set is done by backend.start_equip_set (clear all, then set slot by slot).
 -- @param target_spell_ids table array of spell IDs to equip (1-indexed list)
 -- @param equipped_slots table map of [1..20] = spell_id
 -- @param max_slots number maximum allowed slots (e.g. 20)

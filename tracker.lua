@@ -141,7 +141,8 @@ function M.build(hunting, spellinfo)
                 e.zone_norm[#e.zone_norm + 1] = norm(zname);
             end
 
-            -- Precomputed display strings
+            -- Precomputed display strings (search_name: lowercase name for the tracker search box)
+            e.search_name = e.name:lower();
             local lvl = string.format('[Lv.%2d]', e.level);
             e.header_learned   = string.format('%s %-24s  [LEARNED]###trk_%d', lvl, e.name, id);
             e.header_unlearned = string.format('%s %-24s  [NOT LEARNED]###trk_%d', lvl, e.name, id);

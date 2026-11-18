@@ -1,0 +1,5 @@
+# Release archives are attached to GitHub Releases, not committed
+*.zip
+# Saved sets live in <Ashita>/config/addons/vanablu/, never in the addon folder
+saved_sets.lua
+saved_sets.lua.migrated

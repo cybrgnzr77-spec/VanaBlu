@@ -1,31 +1,29 @@
 --[[
 * =============================================================================
 * VanaBlu for Ashita v4
-* Module: vanablu.lua
+* Module: vanablu.lua (addon entry point: UI, events and commands)
 *
 * Description:
-*   A comprehensive, interactive Blue Magic spell, job trait, and skillchain
-*   guide for Final Fantasy XI, rebuilt for Ashita v4.
+*   Interactive Blue Magic spell, job trait, skillchain and spell-learning guide
+*   for Final Fantasy XI on the VanaDreams (LandSandBoat) server, for Ashita v4.
+*   Ported from the Windower 4 bluGuide addon by Anissa of Cerberus.
 *
-* Architectural Highlights:
-*   - Native Direct3D Dear ImGui rendering via 'd3d_present' event.
-*   - Uses clean two-column layout (Columns API) with zero child-window nesting,
-*     eliminating internal Dear ImGui assertions and orphan Debug windows.
-*   - Full PushID/PopID scoping on all spell rows and slots to completely
-*     prevent Dear ImGui ID collision warnings.
-*   - Native SetTooltip implementation for hover tooltips with zero window leaks.
-*   - Direct memory reading and safe native spell-equipping.
+* Layout of this file:
+*   - Data preparation: spell, trait and category lists built once at load.
+*   - ImGui helpers: thin, allocation-free wrappers used by every view.
+*   - Views: one render function per tab, plus the equipped-spells sidebar.
+*   - Events: d3d_present (UI + set/unset queues), packet_in, command.
 *
-* Author: Anissa of Cerberus (Original Windower 4 concept)
-* Re-engineered for Ashita v4 by Assistant
+* Other modules: backend.lua (client memory + packets), model.lua (limits,
+* traits, set diffs), tracker.lua (spell tracker), setstore.lua (saved sets).
 * =============================================================================
 --]]
 
 addon.name    = 'vanablu';
 addon.author  = 'Anissa (original bluGuide) / Ashita v4 port & VanaBlu enhancements';
-addon.version = '1.0.2';
+addon.version = '1.0.3';
 addon.desc    = 'Interactive Blue Magic spell, trait, skillchain, and hunting guide for Ashita v4.';
-addon.link    = 'https://github.com/mverteuil/windower4-addons/tree/master/vanablu';
+addon.link    = 'https://github.com/Windower/Lua/tree/dev/addons/bluguide'; -- original bluGuide
 
 require('common');
 local imgui   = require('imgui');
@@ -341,6 +339,7 @@ local spell_traits_map = {};
 -- Initialize and sort master data structures once, and precompute static display strings
 local function initialize_data()
     for _, sp in pairs(spells) do
+        sp.search_name = sp.name:lower(); -- lowercase copy for the All Spells search box
         table.insert(ordered_spells, sp);
     end
     table.sort(ordered_spells, function(a, b)
@@ -517,115 +516,135 @@ initialize_data();
 tracker.build(hunting, spells);
 
 -- =============================================================================
--- Safe ImGui Adapter Functions & Lifecycle Tracking
+-- ImGui Helpers & Lifecycle Tracking
 -- =============================================================================
+-- These helpers run many times per frame (the All Spells tab alone draws ~180 rows), so they
+-- call Ashita v4's ImGui binding directly and never allocate: colors are the constant tables
+-- below and widget sizes come from a small cache. Errors are not caught here; the whole frame
+-- is rendered inside one pcall in d3d_present, which also unwinds any style colors left pushed.
 
-local open_styles = 0;
+-- Text / style colors ({ r, g, b, a }, the form Ashita v4's ImGui binding expects).
+local COLOR = {
+    white             = { 1.0, 1.0, 1.0, 1.0 },
+    good              = { 0.4, 1.0, 0.4, 1.0 },
+    caution           = { 1.0, 0.75, 0.3, 1.0 },
+    title             = { 0.95, 0.85, 0.3, 1.0 },
+    frame_border      = { 0.4, 0.65, 0.95, 0.9 },
+    info              = { 0.4, 0.8, 1.0, 1.0 },
+    frame_bg_active   = { 0.28, 0.42, 0.68, 1.0 },
+    frame_bg_hovered  = { 0.24, 0.35, 0.55, 1.0 },
+    frame_bg          = { 0.16, 0.22, 0.35, 1.0 },
+    error             = { 1.0, 0.4, 0.4, 1.0 },
+    label             = { 0.85, 0.9, 1.0, 1.0 },
+    filter_level      = { 0.75, 0.9, 1.0, 1.0 },
+    filter_learned    = { 0.6, 1.0, 0.6, 1.0 },
+    checkmark         = { 0.3, 1.0, 0.45, 1.0 },
+    filter_unlearned  = { 1.0, 0.9, 0.35, 1.0 },
+    unlearned         = { 1.0, 0.85, 0.2, 1.0 },
+    note              = { 1.0, 0.8, 0.35, 1.0 },
+    procs             = { 1.0, 0.7, 0.4, 1.0 },
+    warning           = { 1.0, 0.7, 0.2, 1.0 },
+    zone_unknown      = { 1.0, 0.65, 0.2, 1.0 },
+    waiting           = { 1.0, 0.6, 0.2, 1.0 },
+    skill_low         = { 1.0, 0.45, 0.45, 1.0 },
+    banner            = { 1.0, 0.45, 0.35, 1.0 },
+    summary           = { 0.95, 0.95, 0.95, 1.0 },
+    attributes        = { 0.9, 0.85, 0.4, 1.0 },
+    level_too_high    = { 0.9, 0.4, 0.4, 1.0 },
+    neutral           = { 0.85, 0.85, 0.85, 1.0 },
+    tiers             = { 0.8, 0.85, 0.95, 1.0 },
+    skillchain        = { 0.8, 0.7, 1.0, 1.0 },
+    effects           = { 0.7, 0.95, 0.7, 1.0 },
+    status_idle       = { 0.7, 0.7, 0.75, 1.0 },
+    button_unequip    = { 0.7, 0.2, 0.2, 1.0 },
+    unverified        = { 0.65, 0.65, 0.65, 1.0 },
+    unavailable       = { 0.6, 0.6, 0.6, 1.0 },
+    not_learned       = { 0.55, 0.55, 0.55, 1.0 },
+    traits            = { 0.5, 0.85, 1.0, 1.0 },
+    current_zone      = { 0.4, 0.95, 1.0, 1.0 },
+    zone_label        = { 0.4, 0.85, 1.0, 1.0 },
+    set_traits        = { 0.4, 0.85, 0.95, 1.0 },
+    nav_hovered       = { 0.3, 0.55, 0.95, 1.0 },
+    nav_active        = { 0.2, 0.45, 0.85, 1.0 },
+    nav_pressed       = { 0.15, 0.35, 0.75, 1.0 },
+    button_equip      = { 0.2, 0.6, 0.2, 1.0 },
+};
+
+local open_styles = 0;           -- style colors pushed this frame (unwound by d3d_present on error)
 local last_error_log_time = 0;
 local last_logged_error = '';
 
---- Safely logs a rendering error with rate-limiting to prevent chat spam
+--- Logs a rendering error, rate-limited so a persistent error does not spam the chat log.
 local function log_render_error(err)
     local now = os.clock();
     local err_str = tostring(err);
     if (now - last_error_log_time > 5.0) or (err_str ~= last_logged_error) then
-        print(string.format('\31\200[\31\05VanaBlu Error] %s', err_str));
+        print(string.format('\31\200[\31\05VanaBlu Error] %s', err_str));
         last_error_log_time = now;
         last_logged_error = err_str;
     end
 end
 
---- Safely sets the initial/next window size
-local function safe_set_window_size(w, h)
-    pcall(function()
-        local cond = ImGuiCond_FirstUseEver or 4;
-        if not pcall(function() imgui.SetNextWindowSize({ w, h }, cond); end) then
-            imgui.SetNextWindowSize(w, h, cond);
-        end
-    end);
+-- Cache of { w, h } size tables keyed by dimensions, so widget sizes are built once.
+local size_cache = {};
+local function size(w, h)
+    local key = w * 65536 + h;
+    local s = size_cache[key];
+    if not s then
+        s = { w, h };
+        size_cache[key] = s;
+    end
+    return s;
 end
 
---- Safely renders colored text adapting to table {r,g,b,a} or 5-arg signatures
-local function safe_text_colored(r, g, b, a, text)
-    local col_vec = { r, g, b, a };
-    if pcall(function() imgui.TextColored(col_vec, text); end) then
-        return;
-    end
-    if pcall(function() imgui.TextColored(r, g, b, a, text); end) then
-        return;
-    end
-    pcall(function() imgui.Text(text); end);
+--- Sets the window size used the first time the window is ever shown (ImGui remembers it after that).
+local function set_initial_window_size(w, h)
+    imgui.SetNextWindowSize(size(w, h), ImGuiCond_FirstUseEver or 4);
 end
 
---- Safely renders disabled/dimmed text with fallback to standard text
-local function safe_text_disabled(text)
-    if not text then return end
-    if pcall(function() imgui.TextDisabled(text); end) then
-        return;
-    end
-    safe_text_colored(0.6, 0.6, 0.65, 1.0, text);
+--- Draws text in one of the COLOR constants.
+local function text_colored(color, text)
+    imgui.TextColored(color, text);
 end
 
---- Safely renders a button with optional width and height
-local function safe_button(label, w, h)
-    local clicked = false;
+--- Draws dimmed text. Does nothing for nil text.
+local function text_disabled(text)
+    if text then
+        imgui.TextDisabled(text);
+    end
+end
+
+--- Draws a button; w and h are optional. Returns true when clicked.
+local function button(label, w, h)
     if w and h then
-        local ok = pcall(function() clicked = imgui.Button(label, { w, h }); end);
-        if ok then return clicked; end
-        ok = pcall(function() clicked = imgui.Button(label, w, h); end);
-        if ok then return clicked; end
+        return imgui.Button(label, size(w, h));
     end
-    pcall(function() clicked = imgui.Button(label); end);
-    return clicked;
+    return imgui.Button(label);
 end
 
---- Safely renders bullet text with fallback
-local function safe_bullet_text(text)
-    local ok = pcall(function() imgui.BulletText(text); end);
-    if not ok then
-        pcall(function() imgui.Bullet(); end);
-        pcall(function() imgui.Text(text); end);
-    end
+--- Draws a bullet point followed by text.
+local function bullet_text(text)
+    imgui.BulletText(text);
 end
 
---- Safely pushes a style color adapting to sol2 table argument {r, g, b, a}
-local function safe_push_style_color(idx, r, g, b, a)
-    local col_vec = { r, g, b, a };
-    local ok = pcall(function() imgui.PushStyleColor(idx, col_vec); end);
-    if not ok then
-        ok = pcall(function() imgui.PushStyleColor(idx, r, g, b, a); end);
-    end
-    if ok then
-        open_styles = open_styles + 1;
-    end
-    return ok;
+--- Pushes a style color (one of the COLOR constants) and counts it so it can be unwound.
+local function push_style_color(idx, color)
+    imgui.PushStyleColor(idx, color);
+    open_styles = open_styles + 1;
 end
 
---- Safely pops style colors and tracks open style count
-local function safe_pop_style_color(count)
-    count = count or 1;
-    local actual_pop = math.min(count, open_styles);
-    if actual_pop > 0 then
-        local ok = pcall(function() imgui.PopStyleColor(actual_pop); end);
-        if not ok then
-            for _ = 1, actual_pop do
-                pcall(function() imgui.PopStyleColor(); end);
-            end
-        end
-        open_styles = open_styles - actual_pop;
+--- Pops up to `count` style colors pushed with push_style_color (never more than were pushed).
+local function pop_style_color(count)
+    local n = math.min(count or 1, open_styles);
+    if n > 0 then
+        imgui.PopStyleColor(n);
+        open_styles = open_styles - n;
     end
 end
 
---- Safely renders a progress bar
-local function safe_progress_bar(fraction, w, h, overlay)
-    overlay = overlay or '';
-    local ok = pcall(function() imgui.ProgressBar(fraction, { w, h }, overlay); end);
-    if not ok then
-        ok = pcall(function() imgui.ProgressBar(fraction, w, h, overlay); end);
-        if not ok then
-            imgui.Text(string.format('[Progress: %d%%] %s', math.floor(fraction * 100), overlay));
-        end
-    end
+--- Draws a progress bar of the given size, with optional overlay text.
+local function progress_bar(fraction, w, h, overlay)
+    imgui.ProgressBar(fraction, size(w, h), overlay or '');
 end
 
 --- Sets a temporary user-facing status feedback notification
@@ -699,26 +718,26 @@ local function render_spell_row(sp, equipped_state, limits, learned_map, is_main
 
     local is_equipped = (equipped_state.map[sp.id] ~= nil);
     local is_learned = (learned_map[sp.id] == true);
-    local col = ELEMENT_COLORS[sp.elem_key or sp.element] or { 1.0, 1.0, 1.0, 1.0 };
+    local col = ELEMENT_COLORS[sp.elem_key or sp.element] or COLOR.white;
 
     local btn_label = is_equipped and '[-]##btn' or '[+]##btn';
-    if safe_button(btn_label, 26, 20) then
+    if button(btn_label, 26, 20) then
         handle_spell_click(sp.id, equipped_state, limits, learned_map, is_main);
     end
 
     imgui.SameLine();
 
-    safe_text_colored(col[1], col[2], col[3], col[4], sp.elem_tag or '[???]');
+    text_colored(col, sp.elem_tag or '[???]');
     imgui.SameLine();
 
     local display_text = label_override or sp.default_label;
 
     if is_equipped then
-        safe_text_colored(0.4, 1.0, 0.4, 1.0, display_text);
+        text_colored(COLOR.good, display_text);
     elseif not is_learned then
-        safe_text_colored(0.55, 0.55, 0.55, 1.0, display_text);
+        text_colored(COLOR.not_learned, display_text);
     elseif sp.level > limits.level then
-        safe_text_colored(0.9, 0.4, 0.4, 1.0, display_text);
+        text_colored(COLOR.level_too_high, display_text);
     else
         imgui.Text(display_text);
     end
@@ -732,14 +751,23 @@ end
 -- Tab Views
 -- =============================================================================
 
---- Tab 1: Job Traits Explorer
-local function render_traits_view(equipped_state, limits, learned_map, is_main)
-    imgui.TextDisabled('Expand traits to view contributing spells and active tier thresholds.');
-    imgui.Separator();
+-- Trait evaluations and their display strings only change when the equipped spells or the Job Point
+-- gift change, so they are computed once per change instead of every frame. process_equipped()
+-- returns a new equipped_state table whenever the equipped spells change, so its identity is the key.
+local trait_view_cache = { state = nil, gifts = nil, rows = {} };
 
-    for _, tr in ipairs(trait_list) do
-        local eval = model.evaluate_trait(tr, equipped_state.map, limits.gifts);
-        -- Use ### operator so Dear ImGui keeps the header expanded even when points/title change
+--- Returns the cached { eval, title, tiers_text, next_text } row for every trait, rebuilding if stale.
+local function get_trait_rows(equipped_state, gifts)
+    local cache = trait_view_cache;
+    if cache.state == equipped_state and cache.gifts == gifts then
+        return cache.rows;
+    end
+
+    local rows = {};
+    for i, tr in ipairs(trait_list) do
+        local eval = model.evaluate_trait(tr, equipped_state.map, gifts);
+
+        -- '###' keeps the header's ImGui id fixed, so it stays expanded when the points/tier text changes
         local title = string.format('%s  [Pts: %d%s]###trait_header_%s',
             tr.name,
             eval.current_points,
@@ -747,31 +775,56 @@ local function render_traits_view(equipped_state, limits, learned_map, is_main)
             tr.name
         );
 
-        if imgui.CollapsingHeader(title) then
+        -- Tier summary: active tier in brackets; "JP" tiers are only reachable through the Job Point gift
+        local tier_items = {};
+        for idx, t in ipairs(eval.tiers) do
+            local tag = t.jp_only and string.format('JP: %s', t.text) or string.format('%d pts: %s', t.points, t.text);
+            if idx == eval.active_tier_index then
+                tag = '[' .. tag .. ']';
+            end
+            tier_items[#tier_items + 1] = tag;
+        end
+
+        rows[i] = {
+            eval = eval,
+            title = title,
+            tiers_text = 'Tiers: ' .. table.concat(tier_items, '  ->  '),
+            next_text = eval.points_needed
+                and string.format('Next Tier: %d pts needed (%d/%d)', eval.points_needed, eval.current_points, eval.next_threshold)
+                or nil,
+        };
+    end
+
+    cache.state, cache.gifts, cache.rows = equipped_state, gifts, rows;
+    return rows;
+end
+
+--- Tab 1: Job Traits Explorer
+local function render_traits_view(equipped_state, limits, learned_map, is_main)
+    imgui.TextDisabled('Expand traits to view contributing spells and active tier thresholds.');
+    imgui.Separator();
+
+    local rows = get_trait_rows(equipped_state, limits.gifts);
+    for i, tr in ipairs(trait_list) do
+        local row = rows[i];
+        local eval = row.eval;
+
+        if imgui.CollapsingHeader(row.title) then
             imgui.Indent(14);
 
             if eval.retail then
-                safe_text_colored(1.0, 0.75, 0.3, 1.0, 'This trait is not in the public server code: tiers are converted from retail and may not apply on this server.');
+                text_colored(COLOR.caution, 'This trait is not in the public server code: tiers are converted from retail and may not apply on this server.');
             end
 
-            -- Tiers summary (active tier in brackets; JP = only reachable through the Job Point gift)
-            local tier_items = {};
-            for idx, t in ipairs(eval.tiers) do
-                local tag = t.jp_only and string.format('JP: %s', t.text) or string.format('%d pts: %s', t.points, t.text);
-                if idx == eval.active_tier_index then
-                    tag = '[' .. tag .. ']';
-                end
-                table.insert(tier_items, tag);
-            end
-            safe_text_colored(0.8, 0.85, 0.95, 1.0, 'Tiers: ' .. table.concat(tier_items, '  ->  '));
+            text_colored(COLOR.tiers, row.tiers_text);
             if eval.boosted then
-                safe_text_colored(0.4, 1.0, 0.4, 1.0, 'Raised one tier by the Job Point gift (Lv.99 BLU with 100+ JP spent).');
+                text_colored(COLOR.good, 'Raised one tier by the Job Point gift (Lv.99 BLU with 100+ JP spent).');
             end
 
-            if eval.points_needed then
-                safe_text_colored(0.4, 0.8, 1.0, 1.0, string.format('Next Tier: %d pts needed (%d/%d)', eval.points_needed, eval.current_points, eval.next_threshold));
+            if row.next_text then
+                text_colored(COLOR.info, row.next_text);
             else
-                safe_text_colored(0.4, 1.0, 0.4, 1.0, 'Highest tier reachable with spell points reached.');
+                text_colored(COLOR.good, 'Highest tier reachable with spell points reached.');
             end
 
             imgui.Spacing();
@@ -882,31 +935,29 @@ end
 --- Tab 5: Complete Spells Database
 local function render_all_spells_view(equipped_state, limits, learned_map, is_main)
     -- High-visibility styling for search box and filter checkboxes
-    safe_push_style_color(ImGuiCol_FrameBg or 7, 0.16, 0.22, 0.35, 1.0);
-    safe_push_style_color(ImGuiCol_FrameBgHovered or 8, 0.24, 0.35, 0.55, 1.0);
-    safe_push_style_color(ImGuiCol_FrameBgActive or 9, 0.28, 0.42, 0.68, 1.0);
-    safe_push_style_color(ImGuiCol_CheckMark or 18, 0.30, 1.0, 0.45, 1.0);
-    safe_push_style_color(ImGuiCol_Border or 5, 0.40, 0.65, 0.95, 0.90);
+    push_style_color(ImGuiCol_FrameBg or 7, COLOR.frame_bg);
+    push_style_color(ImGuiCol_FrameBgHovered or 8, COLOR.frame_bg_hovered);
+    push_style_color(ImGuiCol_FrameBgActive or 9, COLOR.frame_bg_active);
+    push_style_color(ImGuiCol_CheckMark or 18, COLOR.checkmark);
+    push_style_color(ImGuiCol_Border or 5, COLOR.frame_border);
 
-    safe_text_colored(0.85, 0.90, 1.0, 1.0, 'Search:');
+    text_colored(COLOR.label, 'Search:');
     imgui.SameLine();
-    pcall(function()
-        imgui.PushItemWidth(140);
-        imgui.InputText('##db_search', gui.search_query, 64);
-        imgui.PopItemWidth();
-    end);
+    imgui.PushItemWidth(140);
+    imgui.InputText('##db_search', gui.search_query, 64);
+    imgui.PopItemWidth();
 
     imgui.SameLine();
-    safe_push_style_color(ImGuiCol_Text or 0, 0.60, 1.0, 0.60, 1.0);
-    pcall(function() imgui.Checkbox('Learned only##db_l', gui.filter_learned_only); end);
-    safe_pop_style_color(1);
+    push_style_color(ImGuiCol_Text or 0, COLOR.filter_learned);
+    imgui.Checkbox('Learned only##db_l', gui.filter_learned_only);
+    pop_style_color(1);
 
     imgui.SameLine();
-    safe_push_style_color(ImGuiCol_Text or 0, 0.75, 0.90, 1.0, 1.0);
-    pcall(function() imgui.Checkbox('My Level only##db_lvl', gui.filter_my_level_only); end);
-    safe_pop_style_color(1);
+    push_style_color(ImGuiCol_Text or 0, COLOR.filter_level);
+    imgui.Checkbox('My Level only##db_lvl', gui.filter_my_level_only);
+    pop_style_color(1);
 
-    safe_pop_style_color(5);
+    pop_style_color(5);
 
     imgui.Separator();
 
@@ -914,7 +965,7 @@ local function render_all_spells_view(equipped_state, limits, learned_map, is_ma
     local matched_count = 0;
     for _, sp in ipairs(ordered_spells) do
         local is_learned = (learned_map[sp.id] == true);
-        local matches_search = (query == '') or sp.name:lower():find(query, 1, true);
+        local matches_search = (query == '') or sp.search_name:find(query, 1, true);
         local matches_learned = not gui.filter_learned_only[1] or is_learned;
         local matches_level = not gui.filter_my_level_only[1] or (sp.level <= limits.level);
 
@@ -938,7 +989,7 @@ local function render_spell_tracker_view(equipped_state, limits, learned_map, is
     local learned_count = gui.cached_learned_count or 0;
 
     local progress_pct = (total_count > 0) and (learned_count / total_count) or 0;
-    safe_progress_bar(progress_pct, -1, 22, string.format('Learned Spells: %d / %d (%.1f%%)', learned_count, total_count, progress_pct * 100));
+    progress_bar(progress_pct, -1, 22, string.format('Learned Spells: %d / %d (%.1f%%)', learned_count, total_count, progress_pct * 100));
 
     -- Player Blue Magic skill (for the per-spell skill requirement)
     local my_skill = nil;
@@ -948,44 +999,42 @@ local function render_spell_tracker_view(equipped_state, limits, learned_map, is
     imgui.Spacing();
 
     -- High-visibility styling for search box and filter checkboxes
-    safe_push_style_color(ImGuiCol_FrameBg or 7, 0.16, 0.22, 0.35, 1.0);
-    safe_push_style_color(ImGuiCol_FrameBgHovered or 8, 0.24, 0.35, 0.55, 1.0);
-    safe_push_style_color(ImGuiCol_FrameBgActive or 9, 0.28, 0.42, 0.68, 1.0);
-    safe_push_style_color(ImGuiCol_CheckMark or 18, 0.30, 1.0, 0.45, 1.0);
-    safe_push_style_color(ImGuiCol_Border or 5, 0.40, 0.65, 0.95, 0.90);
+    push_style_color(ImGuiCol_FrameBg or 7, COLOR.frame_bg);
+    push_style_color(ImGuiCol_FrameBgHovered or 8, COLOR.frame_bg_hovered);
+    push_style_color(ImGuiCol_FrameBgActive or 9, COLOR.frame_bg_active);
+    push_style_color(ImGuiCol_CheckMark or 18, COLOR.checkmark);
+    push_style_color(ImGuiCol_Border or 5, COLOR.frame_border);
 
-    safe_text_colored(0.85, 0.90, 1.0, 1.0, 'Search:');
+    text_colored(COLOR.label, 'Search:');
     imgui.SameLine();
-    pcall(function()
-        imgui.PushItemWidth(125);
-        imgui.InputText('##tracker_search', gui.search_query, 64);
-        imgui.PopItemWidth();
-    end);
+    imgui.PushItemWidth(125);
+    imgui.InputText('##tracker_search', gui.search_query, 64);
+    imgui.PopItemWidth();
 
     imgui.SameLine();
     local prev_l = gui.filter_learned_only[1];
     local prev_u = gui.filter_unlearned_only[1];
 
-    safe_push_style_color(ImGuiCol_Text or 0, 0.60, 1.0, 0.60, 1.0);
-    pcall(function() imgui.Checkbox('Learned only##tr_l', gui.filter_learned_only); end);
-    safe_pop_style_color(1);
+    push_style_color(ImGuiCol_Text or 0, COLOR.filter_learned);
+    imgui.Checkbox('Learned only##tr_l', gui.filter_learned_only);
+    pop_style_color(1);
 
     imgui.SameLine();
-    safe_push_style_color(ImGuiCol_Text or 0, 1.0, 0.90, 0.35, 1.0);
-    pcall(function() imgui.Checkbox('Unlearned only##tr_u', gui.filter_unlearned_only); end);
-    safe_pop_style_color(1);
+    push_style_color(ImGuiCol_Text or 0, COLOR.filter_unlearned);
+    imgui.Checkbox('Unlearned only##tr_u', gui.filter_unlearned_only);
+    pop_style_color(1);
 
     imgui.SameLine();
-    safe_push_style_color(ImGuiCol_Text or 0, 0.75, 0.90, 1.0, 1.0);
-    pcall(function() imgui.Checkbox('My Level only##tr_lvl', gui.filter_my_level_only); end);
-    safe_pop_style_color(1);
+    push_style_color(ImGuiCol_Text or 0, COLOR.filter_level);
+    imgui.Checkbox('My Level only##tr_lvl', gui.filter_my_level_only);
+    pop_style_color(1);
 
     imgui.SameLine();
-    safe_push_style_color(ImGuiCol_Text or 0, 0.40, 0.95, 1.0, 1.0);
-    pcall(function() imgui.Checkbox('Current Zone only##tr_zone', gui.filter_current_zone_only); end);
-    safe_pop_style_color(1);
+    push_style_color(ImGuiCol_Text or 0, COLOR.current_zone);
+    imgui.Checkbox('Current Zone only##tr_zone', gui.filter_current_zone_only);
+    pop_style_color(1);
 
-    safe_pop_style_color(5);
+    pop_style_color(5);
 
     if not prev_l and gui.filter_learned_only[1] then
         gui.filter_unlearned_only[1] = false;
@@ -1003,9 +1052,9 @@ local function render_spell_tracker_view(equipped_state, limits, learned_map, is
     if filter_zone then
         imgui.SameLine();
         if cur_zone_name and cur_zone_name ~= '' then
-            safe_text_colored(0.4, 0.85, 1.0, 1.0, string.format('[Zone: %s]', cur_zone_name));
+            text_colored(COLOR.zone_label, string.format('[Zone: %s]', cur_zone_name));
         else
-            safe_text_colored(1.0, 0.65, 0.2, 1.0, '[Zone: Unknown]');
+            text_colored(COLOR.zone_unknown, '[Zone: Unknown]');
         end
     end
 
@@ -1017,7 +1066,7 @@ local function render_spell_tracker_view(equipped_state, limits, learned_map, is
 
     for _, e in ipairs(entries) do
         local is_learned = (learned_map[e.id] == true);
-        local matches_search = (query == '') or e.name:lower():find(query, 1, true);
+        local matches_search = (query == '') or e.search_name:find(query, 1, true);
         local matches_learned = true;
         if gui.filter_learned_only[1] and not is_learned then matches_learned = false; end
         if gui.filter_unlearned_only[1] and is_learned then matches_learned = false; end
@@ -1029,86 +1078,85 @@ local function render_spell_tracker_view(equipped_state, limits, learned_map, is
             local header_label = is_learned and e.header_learned or e.header_unlearned;
 
             if is_learned then
-                safe_push_style_color(ImGuiCol_Text or 0, 0.4, 1.0, 0.4, 1.0);
+                push_style_color(ImGuiCol_Text or 0, COLOR.good);
             elseif e.status == 'unavailable' then
-                safe_push_style_color(ImGuiCol_Text or 0, 0.6, 0.6, 0.6, 1.0);
+                push_style_color(ImGuiCol_Text or 0, COLOR.unavailable);
             else
-                safe_push_style_color(ImGuiCol_Text or 0, 1.0, 0.85, 0.2, 1.0);
+                push_style_color(ImGuiCol_Text or 0, COLOR.unlearned);
             end
             local is_expanded = imgui.CollapsingHeader(header_label);
-            safe_pop_style_color(1);
+            pop_style_color(1);
 
             if is_expanded then
                 imgui.Indent(14);
                 local sp = e.sp;
 
                 if e.banner then
-                    safe_text_colored(1.0, 0.45, 0.35, 1.0, e.banner);
+                    text_colored(COLOR.banner, e.banner);
                 end
 
-                safe_text_colored(0.95, 0.95, 0.95, 1.0, e.summary);
+                text_colored(COLOR.summary, e.summary);
 
                 -- Skill requirement (server rule: skill >= cap for the spell's level - 29)
                 if e.skill then
                     if my_skill then
                         local ok = my_skill >= e.skill;
-                        local col = ok and { 0.4, 1.0, 0.4 } or { 1.0, 0.45, 0.45 };
-                        safe_text_colored(col[1], col[2], col[3], 1.0, string.format(
+                        text_colored(ok and COLOR.good or COLOR.skill_low, string.format(
                             'Blue Magic skill needed to learn: %d   (yours: %d%s)', e.skill, my_skill,
                             ok and '' or ' - too low, gear bonuses count'));
                     else
-                        safe_text_colored(0.85, 0.85, 0.85, 1.0, string.format('Blue Magic skill needed to learn: %d', e.skill));
+                        text_colored(COLOR.neutral, string.format('Blue Magic skill needed to learn: %d', e.skill));
                     end
                 end
 
-                if e.attributes then safe_text_colored(0.9, 0.85, 0.4, 1.0, e.attributes); end
+                if e.attributes then text_colored(COLOR.attributes, e.attributes); end
                 if sp then
-                    safe_text_colored(0.5, 0.85, 1.0, 1.0, sp.tracker_traits or 'Job Traits: None');
-                    if sp.tracker_skillchain then safe_text_colored(0.8, 0.7, 1.0, 1.0, sp.tracker_skillchain); end
-                    if sp.tracker_effects then safe_text_colored(0.7, 0.95, 0.7, 1.0, sp.tracker_effects); end
-                    if sp.tracker_procs then safe_text_colored(1.0, 0.7, 0.4, 1.0, sp.tracker_procs); end
+                    text_colored(COLOR.traits, sp.tracker_traits or 'Job Traits: None');
+                    if sp.tracker_skillchain then text_colored(COLOR.skillchain, sp.tracker_skillchain); end
+                    if sp.tracker_effects then text_colored(COLOR.effects, sp.tracker_effects); end
+                    if sp.tracker_procs then text_colored(COLOR.procs, sp.tracker_procs); end
                 end
 
                 for _, note in ipairs(e.notes) do
-                    safe_text_colored(1.0, 0.8, 0.35, 1.0, 'Note: ' .. note);
+                    text_colored(COLOR.note, 'Note: ' .. note);
                 end
                 if e.extra_text then
-                    safe_text_disabled(e.extra_text);
+                    text_disabled(e.extra_text);
                 end
 
                 -- Action button: Equip or Unequip (settable spells only)
                 if e.settable and sp then
                     local is_equipped = (equipped_state and equipped_state.map and (equipped_state.map[e.id] ~= nil)) or false;
                     if is_equipped then
-                        safe_push_style_color(ImGuiCol_Button or 21, 0.7, 0.2, 0.2, 1.0);
-                        if safe_button('Unequip Spell##tr_act_' .. e.id, 120, 22) then
+                        push_style_color(ImGuiCol_Button or 21, COLOR.button_unequip);
+                        if button('Unequip Spell##tr_act_' .. e.id, 120, 22) then
                             handle_spell_click(e.id, equipped_state, limits, learned_map, is_main);
                         end
-                        safe_pop_style_color(1);
+                        pop_style_color(1);
                     elseif is_learned then
-                        safe_push_style_color(ImGuiCol_Button or 21, 0.2, 0.6, 0.2, 1.0);
-                        if safe_button('Equip Spell##tr_act_' .. e.id, 120, 22) then
+                        push_style_color(ImGuiCol_Button or 21, COLOR.button_equip);
+                        if button('Equip Spell##tr_act_' .. e.id, 120, 22) then
                             handle_spell_click(e.id, equipped_state, limits, learned_map, is_main);
                         end
-                        safe_pop_style_color(1);
+                        pop_style_color(1);
                     end
                 end
 
                 imgui.Spacing();
-                safe_text_colored(0.4, 0.8, 1.0, 1.0, e.zones_header);
+                text_colored(COLOR.info, e.zones_header);
                 imgui.Separator();
 
                 if #e.zones == 0 then
-                    safe_text_disabled('No learning locations on this server.');
+                    text_disabled('No learning locations on this server.');
                 else
                     for _, z in ipairs(e.zones) do
                         local is_here = tracker.is_current(z, cur_zone_id, override);
                         if is_here then
-                            safe_push_style_color(ImGuiCol_Text or 0, 0.4, 0.95, 1.0, 1.0);
+                            push_style_color(ImGuiCol_Text or 0, COLOR.current_zone);
                         end
                         local z_expanded = imgui.CollapsingHeader(is_here and z.header_current or z.header);
                         if is_here then
-                            safe_pop_style_color(1);
+                            pop_style_color(1);
                         end
 
                         if z_expanded then
@@ -1125,15 +1173,15 @@ local function render_spell_tracker_view(equipped_state, limits, learned_map, is
                                     end
                                 end
                                 if m.conf == 'unverified' then
-                                    safe_push_style_color(ImGuiCol_Text or 0, 0.65, 0.65, 0.65, 1.0);
-                                    safe_bullet_text(text);
-                                    safe_pop_style_color(1);
+                                    push_style_color(ImGuiCol_Text or 0, COLOR.unverified);
+                                    bullet_text(text);
+                                    pop_style_color(1);
                                 else
-                                    safe_bullet_text(text);
+                                    bullet_text(text);
                                 end
                             end
                             if z.more then
-                                safe_text_disabled(string.format('...and %d more monster type%s in this zone.', z.more, z.more == 1 and '' or 's'));
+                                text_disabled(string.format('...and %d more monster type%s in this zone.', z.more, z.more == 1 and '' or 's'));
                             end
                             imgui.Unindent(14);
                             imgui.Spacing();
@@ -1149,25 +1197,25 @@ local function render_spell_tracker_view(equipped_state, limits, learned_map, is
 
     if matched_count == 0 then
         if filter_zone and cur_zone_name ~= '' then
-            safe_text_disabled(string.format('No Blue Magic spells can be learned in "%s" with the active filters.', cur_zone_name));
+            text_disabled(string.format('No Blue Magic spells can be learned in "%s" with the active filters.', cur_zone_name));
         else
-            safe_text_disabled('No Blue Magic spells match the active tracker filter criteria.');
+            text_disabled('No Blue Magic spells match the active tracker filter criteria.');
         end
     end
 end
 
 --- Tab 7: Saved Sets View
 local function render_saved_sets_view(equipped_state, limits, learned_map, is_main)
-    safe_text_colored(0.95, 0.85, 0.3, 1.0, 'Saved Spell Sets Manager');
+    text_colored(COLOR.title, 'Saved Spell Sets Manager');
     imgui.SameLine();
     imgui.TextDisabled('- Save, manage, and instantly swap custom spell configurations');
     imgui.Separator();
 
     -- Show active set equipping banner if in progress
     if backend.is_equipping_set then
-        safe_text_colored(0.4, 0.8, 1.0, 1.0, string.format('Equipping "%s"... (%d changes remaining)', backend.equip_set_name, #backend.equip_queue));
+        text_colored(COLOR.info, string.format('Equipping "%s"... (%d changes remaining)', backend.equip_set_name, #backend.equip_queue));
         imgui.SameLine();
-        if safe_button('Cancel##cancel_equip_btn', 80, 20) then
+        if button('Cancel##cancel_equip_btn', 80, 20) then
             backend.cancel_equip();
             set_status('Equip operation cancelled.', true);
         end
@@ -1176,20 +1224,18 @@ local function render_saved_sets_view(equipped_state, limits, learned_map, is_ma
 
     -- Save Current Set Section
     imgui.Text('Save Current Configuration:');
-    safe_push_style_color(ImGuiCol_FrameBg or 7, 0.16, 0.22, 0.35, 1.0);
-    safe_push_style_color(ImGuiCol_FrameBgHovered or 8, 0.24, 0.35, 0.55, 1.0);
-    safe_push_style_color(ImGuiCol_FrameBgActive or 9, 0.28, 0.42, 0.68, 1.0);
-    safe_push_style_color(ImGuiCol_Border or 5, 0.40, 0.65, 0.95, 0.90);
-    pcall(function()
-        imgui.PushItemWidth(220);
-        imgui.InputText('##new_set_name_input', gui.new_set_name, 64);
-        imgui.PopItemWidth();
-    end);
-    safe_pop_style_color(4);
+    push_style_color(ImGuiCol_FrameBg or 7, COLOR.frame_bg);
+    push_style_color(ImGuiCol_FrameBgHovered or 8, COLOR.frame_bg_hovered);
+    push_style_color(ImGuiCol_FrameBgActive or 9, COLOR.frame_bg_active);
+    push_style_color(ImGuiCol_Border or 5, COLOR.frame_border);
+    imgui.PushItemWidth(220);
+    imgui.InputText('##new_set_name_input', gui.new_set_name, 64);
+    imgui.PopItemWidth();
+    pop_style_color(4);
     imgui.SameLine();
 
     local save_btn_label = 'Save Current Set##btn_save_set';
-    if safe_button(save_btn_label, 150, 24) then
+    if button(save_btn_label, 150, 24) then
         local raw_name = gui.new_set_name[1] or '';
         local set_name = raw_name:match('^%s*(.-)%s*$');
         if not set_name or set_name == '' then
@@ -1219,7 +1265,7 @@ local function render_saved_sets_view(equipped_state, limits, learned_map, is_ma
         end
     end
 
-    safe_text_disabled(string.format('Currently Equipped: %d / %d slots | %d / %d BP',
+    text_disabled(string.format('Currently Equipped: %d / %d slots | %d / %d BP',
         equipped_state.count, limits.slots, equipped_state.points_spent, limits.points));
     imgui.Separator();
 
@@ -1237,7 +1283,7 @@ local function render_saved_sets_view(equipped_state, limits, learned_map, is_ma
 
     if #sorted_names == 0 then
         imgui.Spacing();
-        safe_text_disabled('No saved spell sets found. Equip your desired spells and use the form above to save your first set.');
+        text_disabled('No saved spell sets found. Equip your desired spells and use the form above to save your first set.');
         return;
     end
 
@@ -1273,7 +1319,7 @@ local function render_saved_sets_view(equipped_state, limits, learned_map, is_ma
 
             -- Color the header if fully active
             if is_active then
-                safe_push_style_color(ImGuiCol_Text or 0, 0.4, 1.0, 0.4, 1.0);
+                push_style_color(ImGuiCol_Text or 0, COLOR.good);
             end
 
             local header_label = string.format('%s  (%d Spells, %d BP)%s###saved_set_hdr_%s',
@@ -1281,7 +1327,7 @@ local function render_saved_sets_view(equipped_state, limits, learned_map, is_ma
             local is_expanded = imgui.CollapsingHeader(header_label);
 
             if is_active then
-                safe_pop_style_color(1);
+                pop_style_color(1);
             end
 
             if is_expanded then
@@ -1292,7 +1338,7 @@ local function render_saved_sets_view(equipped_state, limits, learned_map, is_ma
                 local is_this_equipping = (backend.is_equipping_set and backend.equip_set_name == name);
                 local eq_btn_label = is_this_equipping and 'Loading Set...##btn_eq' or 'Load / Equip Set##btn_eq';
 
-                if safe_button(eq_btn_label, 140, 24) then
+                if button(eq_btn_label, 140, 24) then
                     if not backend.is_equipping_set then
                         if not backend.can_set then
                             set_status('Spell setting is unavailable (signatures missing or client in read-only mode).', true);
@@ -1331,7 +1377,7 @@ local function render_saved_sets_view(equipped_state, limits, learned_map, is_ma
 
                 imgui.SameLine();
 
-                if safe_button('Update Set##btn_upd', 110, 24) then
+                if button('Update Set##btn_upd', 110, 24) then
                     if equipped_state.count == 0 then
                         set_status('Cannot update set: you have no spells equipped.', true);
                     else
@@ -1354,7 +1400,7 @@ local function render_saved_sets_view(equipped_state, limits, learned_map, is_ma
 
                 imgui.SameLine();
 
-                if safe_button('Delete Set##btn_del', 100, 24) then
+                if button('Delete Set##btn_del', 100, 24) then
                     gui.saved_sets[name] = nil;
                     save_saved_sets(gui.saved_sets);
                     set_status(string.format('Deleted set "%s".', name), false);
@@ -1376,19 +1422,19 @@ local function render_saved_sets_view(equipped_state, limits, learned_map, is_ma
                 end
 
                 if set.cached_trait_str:sub(1, 10) == 'Job Traits' then
-                    safe_text_colored(0.4, 0.85, 0.95, 1.0, set.cached_trait_str);
+                    text_colored(COLOR.set_traits, set.cached_trait_str);
                 else
-                    safe_text_disabled(set.cached_trait_str);
+                    text_disabled(set.cached_trait_str);
                 end
 
                 if unlearned_count > 0 then
-                    safe_text_colored(1.0, 0.45, 0.45, 1.0, string.format('Notice: %d spell(s) in this set are not learned yet.', unlearned_count));
+                    text_colored(COLOR.skill_low, string.format('Notice: %d spell(s) in this set are not learned yet.', unlearned_count));
                 end
                 if set_bp > limits.points then
-                    safe_text_colored(1.0, 0.4, 0.4, 1.0, string.format('Warning: Set requires %d BP (exceeds current limit of %d BP).', set_bp, limits.points));
+                    text_colored(COLOR.error, string.format('Warning: Set requires %d BP (exceeds current limit of %d BP).', set_bp, limits.points));
                 end
                 if #set.spells > limits.slots then
-                    safe_text_colored(1.0, 0.7, 0.2, 1.0, string.format('Warning: Set contains %d spells (current slot limit is %d).', #set.spells, limits.slots));
+                    text_colored(COLOR.warning, string.format('Warning: Set contains %d spells (current slot limit is %d).', #set.spells, limits.slots));
                 end
 
                 imgui.Separator();
@@ -1413,65 +1459,65 @@ end
 
 --- Tab 8: Documentation & Help
 local function render_help_view()
-    safe_text_colored(0.95, 0.85, 0.3, 1.0, 'VanaBlu for Ashita v4 - Documentation');
+    text_colored(COLOR.title, 'VanaBlu for Ashita v4 - Documentation');
     imgui.Separator();
 
     imgui.Text('Commands:');
-    safe_bullet_text('/vanablu, /vanab, or /vb : Toggle this interface open and closed.');
-    safe_bullet_text('/vanablu show : Display the interface window.');
-    safe_bullet_text('/vanablu hide : Hide the interface window.');
-    safe_bullet_text('/vanablu unsetall : Unset all currently equipped Blue Magic spells.');
-    safe_bullet_text('/vanablu set <setname> or /vanablu load <setname> : Equip/load a saved spell set.');
-    safe_bullet_text('/vanablu save <setname> : Save current spells as a named set.');
-    safe_bullet_text('/vanablu delete <setname> : Delete a saved spell set.');
-    safe_bullet_text('/vanablu list : List all saved spell sets.');
-    safe_bullet_text('/vanablu help : Print available commands to chat log.');
+    bullet_text('/vanablu, /vanab, or /vb : Toggle this interface open and closed.');
+    bullet_text('/vanablu show : Display the interface window.');
+    bullet_text('/vanablu hide : Hide the interface window.');
+    bullet_text('/vanablu unsetall : Unset all currently equipped Blue Magic spells.');
+    bullet_text('/vanablu set <setname> or /vanablu load <setname> : Equip/load a saved spell set.');
+    bullet_text('/vanablu save <setname> : Save current spells as a named set.');
+    bullet_text('/vanablu delete <setname> : Delete a saved spell set.');
+    bullet_text('/vanablu list : List all saved spell sets.');
+    bullet_text('/vanablu help : Print available commands to chat log.');
 
     imgui.Spacing();
     imgui.Text('How Setting Spells Works:');
-    safe_bullet_text('Click [+] next to any spell to set it in your first free spell slot.');
-    safe_bullet_text('Click [-] or [X] on an equipped spell to remove it.');
-    safe_bullet_text('Spell changes use the game client native memory routine with built-in cooldowns.');
-    safe_bullet_text('If your client uses custom signatures, VanaBlu operates in Read-Only Reference Mode.');
-    safe_bullet_text('Spell Tracker tab: every spell learnable on this server (including Unbridled Learning spells), with learned status and the monsters/zones that teach it.');
-    safe_bullet_text('Saved Sets tab: Save and name custom spell configurations with one-click equip, update, and delete actions.');
-    safe_bullet_text('Saved sets are stored in Ashita\\config\\addons\\vanablu\\saved_sets.lua and are kept when the addon is updated.');
+    bullet_text('Click [+] next to any spell to set it in your first free spell slot.');
+    bullet_text('Click [-] or [X] on an equipped spell to remove it.');
+    bullet_text('Spell changes are sent to the server one at a time, about 0.75 seconds apart.');
+    bullet_text('When Blue Mage is not your main or support job, VanaBlu is a read-only reference.');
+    bullet_text('Spell Tracker tab: every spell learnable on this server (including Unbridled Learning spells), with learned status and the monsters/zones that teach it.');
+    bullet_text('Saved Sets tab: Save and name custom spell configurations with one-click equip, update, and delete actions.');
+    bullet_text('Saved sets are stored in Ashita\\config\\addons\\vanablu\\saved_sets.lua and are kept when the addon is updated.');
 
     imgui.Spacing();
     imgui.Text('Learning Blue Magic (server rules):');
-    safe_bullet_text('Blue Mage must be your MAIN job, alive, and in the same party/alliance as whoever claimed the monster.');
-    safe_bullet_text('The monster must actually finish using the move during the fight, and you must be nearby when it dies.');
-    safe_bullet_text('Your Blue Magic skill (gear bonuses count) must be within 29 of the skill cap for the spell\'s level.');
-    safe_bullet_text('Base chance is 33% per kill. Only one learning attempt is made per kill, even if the monster used several learnable moves.');
-    safe_bullet_text('No learning if someone called for help. If the monster regains full HP, the moves it used are forgotten.');
-    safe_bullet_text('"Too Weak" monsters can still teach spells (no experience requirement).');
-    safe_bullet_text('In the tracker, "nearest known spawn" shows the distance/direction to the closest spawn point while you are in that zone.');
-    safe_bullet_text('Entries marked "location from wiki" or "UNVERIFIED" are not confirmed for this server.');
+    bullet_text('Blue Mage must be your MAIN job, alive, and in the same party/alliance as whoever claimed the monster.');
+    bullet_text('The monster must actually finish using the move during the fight, and you must be nearby when it dies.');
+    bullet_text('Your Blue Magic skill (gear bonuses count) must be within 29 of the skill cap for the spell\'s level.');
+    bullet_text('Base chance is 33% per kill. Only one learning attempt is made per kill, even if the monster used several learnable moves.');
+    bullet_text('No learning if someone called for help. If the monster regains full HP, the moves it used are forgotten.');
+    bullet_text('"Too Weak" monsters can still teach spells (no experience requirement).');
+    bullet_text('In the tracker, "nearest known spawn" shows the distance/direction to the closest spawn point while you are in that zone.');
+    bullet_text('Entries marked "location from wiki" or "UNVERIFIED" are not confirmed for this server.');
 
     imgui.Spacing();
     imgui.Text('Job Traits & Gifts:');
-    safe_bullet_text('Traits automatically update in real-time as spells are equipped or unequipped.');
-    safe_bullet_text('Trait points follow the server: most spells add 1 point and level-99 spells add 2. Tiers unlock at the listed point totals.');
-    safe_bullet_text('Main-job BLU at level 99 with 100+ Job Points spent gets +1 tier on every active trait (Job Point gift).');
-    safe_bullet_text('That bonus can reach tiers marked "JP" and turns Double Attack into Triple Attack and Gilfinder into Treasure Hunter.');
-    safe_bullet_text('Traits or spells marked "retail" are not in the public server code and may not apply on this server.');
+    bullet_text('Traits automatically update in real-time as spells are equipped or unequipped.');
+    bullet_text('Trait points follow the server: most spells add 1 point and level-99 spells add 2. Tiers unlock at the listed point totals.');
+    bullet_text('Main-job BLU at level 99 with 100+ Job Points spent gets +1 tier on every active trait (Job Point gift).');
+    bullet_text('That bonus can reach tiers marked "JP" and turns Double Attack into Triple Attack and Gilfinder into Treasure Hunter.');
+    bullet_text('Traits or spells marked "retail" are not in the public server code and may not apply on this server.');
 end
 
 -- =============================================================================
 -- Left Sidebar: Equipped Spells & Capacity Meters
 -- =============================================================================
 local function render_equipped_sidebar(equipped_state, limits, learned_map, is_main)
-    safe_text_colored(0.95, 0.85, 0.3, 1.0, 'Equipped Blue Magic');
+    text_colored(COLOR.title, 'Equipped Blue Magic');
     imgui.Separator();
 
     -- Capacity meters
     local slot_fraction = limits.slots > 0 and (equipped_state.count / limits.slots) or 0;
     imgui.Text(string.format('Slots: %d / %d', equipped_state.count, limits.slots));
-    safe_progress_bar(slot_fraction, -1, 14);
+    progress_bar(slot_fraction, -1, 14);
 
     local points_fraction = limits.points > 0 and (equipped_state.points_spent / limits.points) or 0;
     imgui.Text(string.format('Set Points: %d / %d', equipped_state.points_spent, limits.points));
-    safe_progress_bar(points_fraction, -1, 14);
+    progress_bar(points_fraction, -1, 14);
 
     local job_label = limits.is_main and 'Main Job' or 'Support Job';
     if (limits.bonus_points or 0) > 0 then
@@ -1494,15 +1540,15 @@ local function render_equipped_sidebar(equipped_state, limits, learned_map, is_m
     -- received yet, the calculated maximum may be missing up to 20 BP. Tell the player how to fix it.
     if limits.is_main and limits.level == 99 and limits.points_source ~= 'client'
         and backend.jp_bp_bonus == nil and (limits.jp_spent or 0) > 0 then
-        safe_text_colored(1.0, 0.75, 0.3, 1.0, 'Set Points may be low: open the in-game');
-        safe_text_colored(1.0, 0.75, 0.3, 1.0, 'Job Points or Set Blue Magic menu once.');
+        text_colored(COLOR.caution, 'Set Points may be low: open the in-game');
+        text_colored(COLOR.caution, 'Job Points or Set Blue Magic menu once.');
     end
 
     imgui.Separator();
 
-    -- Unset All Button (Maps to native "(Remove all spells)" and queued frame pump)
+    -- Unset All button (see backend.unset_all)
     local unset_btn_text = backend.is_unsetting and 'Clearing Spells...##btn_unset_all' or 'Unset All Spells##btn_unset_all';
-    if safe_button(unset_btn_text, -1, 24) then
+    if button(unset_btn_text, -1, 24) then
         if not backend.is_unsetting then
             if backend.can_set then
                 local ok, msg = backend.unset_all(is_main, equipped_state.slots);
@@ -1525,14 +1571,14 @@ local function render_equipped_sidebar(equipped_state, limits, learned_map, is_m
         local sp_id = equipped_state.slots[slot];
         if sp_id and sp_id > 0 and spells[sp_id] then
             local sp = spells[sp_id];
-            local col = ELEMENT_COLORS[sp.elem_key or sp.element] or { 1.0, 1.0, 1.0, 1.0 };
+            local col = ELEMENT_COLORS[sp.elem_key or sp.element] or COLOR.white;
 
-            if safe_button('[X]##eq_btn', 24, 18) then
+            if button('[X]##eq_btn', 24, 18) then
                 handle_spell_click(sp.id, equipped_state, limits, learned_map, is_main);
             end
             imgui.SameLine();
 
-            safe_text_colored(col[1], col[2], col[3], col[4], string.format('%2d. %s (%d)', slot, sp.name, sp.cost or 0));
+            text_colored(col, string.format('%2d. %s (%d)', slot, sp.name, sp.cost or 0));
             render_spell_tooltip(sp, true, true);
         else
             imgui.TextDisabled(EMPTY_SLOT_LABELS[slot] or string.format('%2d. [Empty]', slot));
@@ -1545,22 +1591,22 @@ end
 -- Right Content: Navigation Tabs & Selected View
 -- =============================================================================
 local function render_navigation_and_content(equipped_state, limits, learned_map, is_main, player_data)
-    -- Universal Navigation Buttons (100% reliable across all Ashita v4 builds)
+    -- Tab buttons (plain buttons styled as tabs; the active tab is highlighted)
     for idx, tab_name in ipairs(NAV_TABS) do
         local is_active = (gui.active_tab == tab_name);
         if is_active then
-            safe_push_style_color(ImGuiCol_Button or 21, 0.2, 0.45, 0.85, 1.0);
-            safe_push_style_color(ImGuiCol_ButtonHovered or 22, 0.3, 0.55, 0.95, 1.0);
-            safe_push_style_color(ImGuiCol_ButtonActive or 23, 0.15, 0.35, 0.75, 1.0);
+            push_style_color(ImGuiCol_Button or 21, COLOR.nav_active);
+            push_style_color(ImGuiCol_ButtonHovered or 22, COLOR.nav_hovered);
+            push_style_color(ImGuiCol_ButtonActive or 23, COLOR.nav_pressed);
         end
 
         local btn_lbl = is_active and TAB_BUTTON_LABELS_ACTIVE[tab_name] or TAB_BUTTON_LABELS_INACTIVE[tab_name];
-        if safe_button(btn_lbl, 0, 24) then
+        if button(btn_lbl, 0, 24) then
             gui.active_tab = tab_name;
         end
 
         if is_active then
-            safe_pop_style_color(3);
+            pop_style_color(3);
         end
 
         if idx < #NAV_TABS then
@@ -1590,12 +1636,19 @@ local function render_navigation_and_content(equipped_state, limits, learned_map
     end
 end
 
+--- Returns true if BLU is the main job, false if it is the support job, or nil if unknown
+--- (no player data, e.g. while zoning). Note: `pd and pd.is_main or true` would turn false into true.
+local function blu_is_main(pd)
+    if pd == nil then return nil; end
+    return pd.is_main == true;
+end
+
 -- =============================================================================
 -- Main Direct3D Presentation Loop (Ashita v4 Event)
 -- =============================================================================
 ashita.events.register('d3d_present', 'vanablu_present_cb', function()
-    -- Lightweight Optimization: If window is closed and no background queue is active,
-    -- skip all memory polling and rendering entirely to consume zero idle CPU cycles.
+    -- When the window is closed and no set/unset queue is running, skip memory reads and
+    -- rendering entirely, so the addon costs almost nothing while hidden.
     local is_busy = backend.is_unsetting or backend.is_equipping_set;
     if not gui.is_open[1] and not is_busy then
         return;
@@ -1609,14 +1662,18 @@ ashita.events.register('d3d_present', 'vanablu_present_cb', function()
     -- Read player state once per frame if backend is active
     local player_data, err = nil, nil;
     if backend.is_initialized then
-        pcall(function()
-            player_data, err = backend.read();
-        end);
+        local ok, pd, msg = pcall(backend.read);
+        if ok then
+            player_data, err = pd, msg;
+        else
+            err = tostring(pd);
+        end
     end
 
     -- Service active asynchronous queues (runs even if UI is closed so operations finish cleanly)
     if backend.is_initialized then
-        local is_m = (player_data and player_data.is_main ~= nil) and player_data.is_main or true;
+        -- nil while zoning/loading: the backend then keeps using the job the queue was started with
+        local is_m = blu_is_main(player_data);
 
         if backend.is_unsetting then
             local r_slots = player_data and player_data.raw or nil;
@@ -1640,26 +1697,26 @@ ashita.events.register('d3d_present', 'vanablu_present_cb', function()
     end
 
     -- Set default initial window size
-    safe_set_window_size(1020, 640);
+    set_initial_window_size(1020, 640);
 
-    local window_title = WINDOW_TITLE;
-    local window_open = false;
+    local began = false;
 
     -- Reset per-frame tracking
     open_styles = 0;
 
     local render_ok, render_err = pcall(function()
-        window_open = imgui.Begin(window_title, gui.is_open);
-        if not window_open then
-            return;
+        local visible = imgui.Begin(WINDOW_TITLE, gui.is_open);
+        began = true;
+        if not visible then
+            return; -- collapsed or fully clipped: nothing to draw, but End() is still required
         end
 
         -- Character state loading guard
         if not player_data or not player_data.ready then
             local msg = err or (player_data and player_data.message) or 'Waiting for Blue Mage character data...';
-            safe_text_colored(1.0, 0.6, 0.2, 1.0, msg);
+            text_colored(COLOR.waiting, msg);
             imgui.Spacing();
-            if safe_button('Manual Refresh##retry_mem', 140, 26) then
+            if button('Manual Refresh##retry_mem', 140, 26) then
                 backend.init();
                 gui.cached_learned_map = nil;
                 gui.cached_limits = nil;
@@ -1739,29 +1796,25 @@ ashita.events.register('d3d_present', 'vanablu_present_cb', function()
         -- Top status bar / notification banner
         if gui.status_message ~= '' and (os.clock() - gui.status_time < 5.0) then
             if gui.status_is_error then
-                safe_text_colored(1.0, 0.4, 0.4, 1.0, gui.status_message);
+                text_colored(COLOR.error, gui.status_message);
             else
-                safe_text_colored(0.4, 1.0, 0.4, 1.0, gui.status_message);
+                text_colored(COLOR.good, gui.status_message);
             end
         else
-            safe_text_colored(0.7, 0.7, 0.75, 1.0, player_data.message or 'Ready.');
+            text_colored(COLOR.status_idle, player_data.message or 'Ready.');
         end
 
         imgui.Separator();
 
-        -- Two-Column Layout using native Columns API (clean, stable, zero child-window issues)
-        local cols_ok = pcall(function()
-            imgui.Columns(2, 'vanablu_columns', true);
-            imgui.SetColumnWidth(0, 280);
-        end);
+        -- Two-column layout: equipped spells on the left, tabs on the right
+        imgui.Columns(2, 'vanablu_columns', true);
+        imgui.SetColumnWidth(0, 280);
 
         -- Column 1: Equipped Spells Sidebar
         render_equipped_sidebar(equipped_state, limits, learned_map, player_data.is_main);
 
         -- Column 2: Navigation & Content
-        if cols_ok then
-            pcall(function() imgui.NextColumn(); end);
-        end
+        imgui.NextColumn();
         -- Cache zone info from player data
         if player_data and player_data.zone_name and player_data.zone_name ~= '' then
             gui.cached_zone_name = player_data.zone_name;
@@ -1770,20 +1823,19 @@ ashita.events.register('d3d_present', 'vanablu_present_cb', function()
         render_navigation_and_content(equipped_state, limits, learned_map, player_data.is_main, player_data);
 
         -- Restore single column
-        if cols_ok then
-            pcall(function() imgui.Columns(1); end);
-        end
+        imgui.Columns(1);
     end);
 
-    -- Emergency cleanup: unwind any style colors left open due to mid-frame error
-    while open_styles > 0 do
-        pcall(function() imgui.PopStyleColor(); end);
-        open_styles = open_styles - 1;
+    -- Error cleanup: pop any style colors a failed frame left pushed
+    if open_styles > 0 then
+        pcall(imgui.PopStyleColor, open_styles);
+        open_styles = 0;
     end
 
-    -- Crucial: imgui.End() must ALWAYS be called if imgui.Begin() returned true
-    if window_open then
-        pcall(function() imgui.End(); end);
+    -- Dear ImGui requires End() after every Begin(), whatever Begin() returned
+    -- (it returns false while the window is collapsed).
+    if began then
+        pcall(imgui.End);
     end
 
     if not render_ok then
@@ -1801,6 +1853,12 @@ end);
 -- =============================================================================
 -- Command Handling (Ashita v4 Standard)
 -- =============================================================================
+--- Reads the player state for a command; returns nil if it cannot be read right now.
+local function read_player()
+    local ok, pd = pcall(backend.read);
+    return ok and pd or nil;
+end
+
 local function print_help()
     print('[VanaBlu] Command Reference:');
     print('  /vanablu, /vanab, or /vb - Toggle the VanaBlu window.');
@@ -1835,12 +1893,11 @@ ashita.events.register('command', 'vanablu_command_cb', function(e)
                     gui.is_open[1] = not gui.is_open[1];
                 elseif sub == 'unsetall' or sub == 'clear' or sub == 'reset' then
                     if backend.can_set then
-                        local p_data = nil;
-                        pcall(function() p_data = backend.read(); end);
-                        local is_m = p_data and p_data.is_main or true;
+                        local p_data = read_player();
+                        local is_m = blu_is_main(p_data);
                         local r_slots = p_data and p_data.raw or {};
-                        backend.unset_all(is_m, r_slots);
-                        print('[VanaBlu] Clearing all equipped Blue Magic spells...');
+                        local ok, msg = backend.unset_all(is_m, r_slots);
+                        print('[VanaBlu] ' .. (msg or (ok and 'Clearing all equipped Blue Magic spells...' or 'Could not clear spells.')));
                     else
                         print('[VanaBlu] Spell setting is unavailable.');
                     end
@@ -1855,9 +1912,8 @@ ashita.events.register('command', 'vanablu_command_cb', function(e)
                             end
                         end
                         if matched_set then
-                            local p_data = nil;
-                            pcall(function() p_data = backend.read(); end);
-                            local is_m = p_data and p_data.is_main or true;
+                            local p_data = read_player();
+                            local is_m = blu_is_main(p_data);
                             local lim = model.get_limits(p_data and p_data.level or 1, is_m, p_data and p_data.assimilation, p_data and p_data.blue_point_bonus, p_data and p_data.jp_spent, p_data and p_data.client_max_points);
                             local eq_s = model.process_equipped(p_data and p_data.raw or {}, spells);
                             local l_map = gui.cached_learned_map or backend.read_learned(p_data and p_data.player, spells);
@@ -1884,8 +1940,7 @@ ashita.events.register('command', 'vanablu_command_cb', function(e)
                 elseif sub == 'save' then
                     if #args >= 3 then
                         local target_name = table.concat(args, ' ', 3);
-                        local p_data = nil;
-                        pcall(function() p_data = backend.read(); end);
+                        local p_data = read_player();
                         local eq_s = model.process_equipped(p_data and p_data.raw or {}, spells);
                         if eq_s.count == 0 then
                             print('[VanaBlu] Cannot save empty set. Equip spells first.');
@@ -1948,8 +2003,7 @@ ashita.events.register('command', 'vanablu_command_cb', function(e)
                             print(string.format('[VanaBlu] Tracker zone filter manually set to: "%s".', z_name));
                         end
                     else
-                        local p_data = nil;
-                        pcall(function() p_data = backend.read(); end);
+                        local p_data = read_player();
                         local cur_z = (gui.override_zone_name ~= '' and gui.override_zone_name) or (p_data and p_data.zone_name) or 'Unknown';
                         print(string.format('[VanaBlu] Current Zone: %s (Zone ID: %d)', cur_z, p_data and p_data.zone_id or 0));
                         print('  To override or test: /vanablu zone <zonename> (or /vanablu zone reset)');

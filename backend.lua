@@ -4,41 +4,29 @@
 * Module: backend.lua
 *
 * Description:
-*   High-performance, low-level client memory reading and authoritative packet
-*   injection backend for Blue Magic spell management in Ashita v4.
+*   Game client access for VanaBlu: reads the player's Blue Mage state and
+*   equipped spells from client memory, and changes spells by sending Blue
+*   Magic set packets (0x102) to the server.
 *
-* Performance & Architecture Standards:
-*   1. Zero Per-Frame Garbage:
-*      All state snapshots and raw memory buffers are pre-allocated and reused
-*      in place across frame cycles. Zero table allocations occur during steady-
-*      state memory monitoring.
-*   2. Authoritative FFXI Network Protocol (Packet 0x102):
-*      Uses the exact packet architecture from atom0s's official Ashita blusets
-*      addon (https://git.ashitaxi.com/Addons/blusets).
-*   3. Atomic Batch Reset:
-*      Dispatches atom0s's single 164-byte 0x102 batch reset packet to clear
-*      all 20 equipped Blue Magic slots simultaneously on the server.
-*   4. Settle Window & Rate Limiting:
-*      - 1.25s post-reset settle delay before sending the first spell in a set,
-*        guaranteeing the server completes unsetting before receiving Spell 1.
-*      - 0.75s pacing between consecutive spell equip/unset commands, absorbing
-*        network latency jitter while remaining responsive.
-*   5. Double-Dereferenced Memory Reading:
-*      Traverses Ashita's inventory pointer manager using the official blusets
-*      pattern (pointer = read_uint32(read_uint32(pInventory))) with multi-tier
-*      fallbacks (+0x04 for main BLU, +0xA0 for sub BLU) to ensure equipped
-*      spells are never erroneously reported as empty.
-*   6. Module-Targeted Signature Scanning:
-*      Pattern searches target 'FFXiMain.dll' directly, avoiding false negatives
-*      from scanning the PlayOnline Viewer container process.
+* How it works:
+*   - Memory: the signatures, pointer chain and offsets are the ones used by
+*     atom0s's blusets addon that ships with Ashita v4 (addons/blusets/blu.lua).
+*     The equipped spell buffer is inventory -> [0] -> +offset, then +0x04 (BLU
+*     main) or +0xA0 (BLU support).
+*   - Changing spells: each change sends a 0x102 packet built like blusets'
+*     "fast" mode and, when its signature is found, also calls the client's own
+*     setter function (blusets' "safe" mode).
+*   - Pacing: single spell changes are throttled to one every 0.75s; set loads
+*     wait 1.25s after the clear packet, then send one spell every 0.75s.
+*   - read() reuses one state table and one 20-byte buffer, so polling it every
+*     frame does not allocate tables.
 *
-* Author: Anissa (Original Windower 4 concept)
-* Fully Optimized, Hardened & Packet-Engineered by Assistant
-* Version: 2.1.5
+* Original bluGuide (Windower 4) by Anissa of Cerberus.
 * =============================================================================
 --]]
 
 local ffi = require('ffi');
+local unpack = unpack or table.unpack; -- LuaJIT global / Lua 5.2+ (tests)
 
 -- Define the C function signature for the game client's internal Blue Magic setter function (auxiliary sync)
 ffi.cdef[[
@@ -47,7 +35,7 @@ ffi.cdef[[
 
 local M = {
     is_initialized         = false,
-    can_set                = true, -- Packet 0x102 injection is universally supported in Ashita
+    can_set                = true, -- Spell changes are always attempted (packets need no signature)
     init_message           = 'Backend not initialized',
     last_write_time        = -100,
     write_cooldown         = 0.75, -- Safe inter-spell equip throttle (0.75s) to absorb network/server jitter
@@ -64,6 +52,10 @@ local M = {
     last_equip_action_time = -100,
     equip_target_main      = true,
     equip_is_first_action  = false,
+
+    -- true while Blue Mage is the main or support job (updated by read()). Spell changes are refused
+    -- otherwise, since the server ignores Blue Magic packets from other jobs.
+    blu_active             = false,
 
     -- Blue Magic Point Bonus job point rank (0-20), learned from incoming packet 0x08D.
     -- nil until the server has sent the player's job point details this session.
@@ -147,16 +139,25 @@ local JOB_NAMES = {
     [20] = 'SCH', [21] = 'GEO', [22] = 'RUN'
 };
 
---- Builds the binary string and table representation for setting a single spell via packet 0x102.
--- Matches atom0s's blusets implementation:
--- Header (12 bytes): 0x02, 0x53, 0x00, 0x00, spell_byte, 0x00, 0x00, 0x00, 0x10, isSubBlu, 0x00, 0x00
--- Payload (152 / 0x98 bytes): (slot - 1) zeros .. spell_byte .. (0x98 - slot) zeros
--- Total Packet Length: 164 bytes (0xA4)
--- @param spell_id number Full spell ID (e.g. 513) or 0
--- @param slot_1based number 1-indexed slot number (1 to 20)
--- @param is_sub boolean true if Blue Mage is sub/support job
--- @return string raw binary string of length 164
--- @return table byte/character array table for Ashita AddOutgoingPacket
+-- Packet 0x102 layout (164 bytes), as read by LandSandBoat (0x102_extended_job.cpp):
+--   0x00  header 0x02 0x53 0x00 0x00 (id/size/sync, filled in by the client)
+--   0x04  SpellId     uint8   spell to set (spell id - 512), or 0 when unsetting
+--   0x08  JobIndex    uint8   0x10 (BLU)
+--   0x09  IsSubJob    uint8   1 if BLU is the support job (LandSandBoat does not check this)
+--   0x0C  Spells[20]  uint8   setting: the spell byte in the target slot
+--                             unsetting: the current spell byte in each slot to clear
+--   0x20  padding up to 164 bytes
+
+--- Converts a packet string into the byte table Ashita v4's AddOutgoingPacket expects.
+local function to_bytes(p_str)
+    return { p_str:byte(1, -1) };
+end
+
+--- Builds a packet that sets one spell in one slot (same layout as blusets' fast set).
+-- @param spell_id number full spell id (e.g. 513)
+-- @param slot_1based number slot 1..20
+-- @param is_sub boolean true if BLU is the support job
+-- @return table 164 packet bytes
 local function build_set_packet(spell_id, slot_1based, is_sub)
     local isSubBlu = is_sub and 1 or 0;
     local spell_byte = (spell_id and spell_id > 0) and math.max(0, math.min(255, spell_id - 512)) or 0;
@@ -164,125 +165,55 @@ local function build_set_packet(spell_id, slot_1based, is_sub)
 
     local header = string.char(0x02, 0x53, 0x00, 0x00, spell_byte, 0x00, 0x00, 0x00, 0x10, isSubBlu, 0x00, 0x00);
     local payload = (ZERO_PADS[slot_1based - 1] or '') .. string.char(spell_byte) .. (ZERO_PADS[152 - slot_1based] or '');
-    local p_str = header .. payload;
-
-    local p_tbl = nil;
-    if p_str.totable then
-        local ok, res = pcall(function() return p_str:totable(); end);
-        if ok and type(res) == 'table' then p_tbl = res; end
-    end
-    if not p_tbl then
-        p_tbl = {};
-        for i = 1, #p_str do p_tbl[i] = p_str:sub(i, i); end
-    end
-
-    return p_str, p_tbl;
+    return to_bytes(header .. payload);
 end
 
---- Builds the binary string and table representation for unsetting a single slot via packet 0x102.
--- @param slot_1based number 1-indexed slot number (1 to 20)
--- @param is_sub boolean true if Blue Mage is sub/support job
--- @return string raw binary string of length 164
--- @return table byte/character array table
+--- Builds a packet for unsetting one slot.
+-- Note: Spells[] is left all zero, so LandSandBoat finds no slot to clear and ignores this packet.
+-- The removal itself is done by the client setter call that set_spell()/tick_unset_queue() make
+-- right after sending it. (blusets' fast unset instead puts the slot's current spell byte here.)
+-- @param slot_1based number slot 1..20
+-- @param is_sub boolean true if BLU is the support job
+-- @return table 164 packet bytes
 local function build_unset_packet(slot_1based, is_sub)
     local isSubBlu = is_sub and 1 or 0;
     slot_1based = math.max(1, math.min(20, slot_1based or 1));
 
     local header = string.char(0x02, 0x53, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, isSubBlu, 0x00, 0x00);
     local payload = (ZERO_PADS[slot_1based - 1] or '') .. '\0' .. (ZERO_PADS[152 - slot_1based] or '');
-    local p_str = header .. payload;
-
-    local p_tbl = nil;
-    if p_str.totable then
-        local ok, res = pcall(function() return p_str:totable(); end);
-        if ok and type(res) == 'table' then p_tbl = res; end
-    end
-    if not p_tbl then
-        p_tbl = {};
-        for i = 1, #p_str do p_tbl[i] = p_str:sub(i, i); end
-    end
-
-    return p_str, p_tbl;
+    return to_bytes(header .. payload);
 end
 
---- Builds the authoritative batch reset_all_spells packet 0x102 from atom0s's blusets addon.
--- Header: 0x02, 0x53, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, isSubBlu, 0x00, 0x00
--- Payload: 20 bytes of currently equipped spells, followed by 132 (0x84) bytes of 0x00 zeros.
--- When received, the FFXI server atomically unsets all spell slots at once!
--- @param raw_spells table 20-byte array of currently equipped spells
--- @param is_sub boolean true if Blue Mage is sub/support job
--- @return string raw binary string of length 164
--- @return table byte/character array table
+--- Builds a packet that clears every listed slot at once (same layout as blusets' fast reset).
+-- Spells[] carries the currently equipped spell bytes; the server unsets each one in a single
+-- packet. It aborts at the first listed slot that is already empty, so the bytes must be current.
+-- @param raw_spells table 20 current spell bytes (0 = empty)
+-- @param is_sub boolean true if BLU is the support job
+-- @return table 164 packet bytes
 local function build_reset_all_packet(raw_spells, is_sub)
     local isSubBlu = is_sub and 1 or 0;
     local header = string.char(0x02, 0x53, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, isSubBlu, 0x00, 0x00);
-    
+
     local clean_bytes = {};
     for x = 1, 20 do
         local sp = (raw_spells and raw_spells[x]) or 0;
         clean_bytes[x] = math.max(0, math.min(255, sp));
     end
     local payload = string.char(unpack(clean_bytes, 1, 20)) .. STATIC_RESET_PADDING;
-    local p_str = header .. payload;
-
-    local p_tbl = nil;
-    if p_str.totable then
-        local ok, res = pcall(function() return p_str:totable(); end);
-        if ok and type(res) == 'table' then p_tbl = res; end
-    end
-    if not p_tbl then
-        p_tbl = {};
-        for i = 1, #p_str do p_tbl[i] = p_str:sub(i, i); end
-    end
-
-    return p_str, p_tbl;
+    return to_bytes(header .. payload);
 end
 
---- Dispatches an outgoing packet to the game server via Ashita's packet subsystem.
--- Tries both binary string (Ashita v4 standard) and character/byte table (Ashita v3 standard)
--- across global AddOutgoingPacket and AshitaCore:GetPacketManager():AddOutgoingPacket.
--- @param id number packet ID (0x102)
--- @param pkt_str string raw binary string
--- @param pkt_tbl table byte/character table
--- @return boolean true if dispatched
-local function dispatch_packet(id, pkt_str, pkt_tbl)
-    local sent = false;
-
-    -- Method 1: Global AddOutgoingPacket (primary in Ashita)
-    if AddOutgoingPacket then
-        if pkt_str then
-            local ok = pcall(AddOutgoingPacket, id, pkt_str);
-            if ok then sent = true; end
-        end
-        if not sent and pkt_tbl then
-            local ok = pcall(AddOutgoingPacket, id, pkt_tbl);
-            if ok then sent = true; end
-        end
-    end
-
-    -- Method 2: AshitaCore:GetPacketManager():AddOutgoingPacket
-    pcall(function()
-        local pm = AshitaCore:GetPacketManager();
-        if pm and pm.AddOutgoingPacket then
-            if pkt_str then
-                local ok = pcall(function() pm:AddOutgoingPacket(id, pkt_str); end);
-                if ok then sent = true; end
-            end
-            if not sent and pkt_tbl then
-                local ok = pcall(function() pm:AddOutgoingPacket(id, pkt_tbl); end);
-                if ok then sent = true; end
-            end
-        end
+--- Sends an outgoing packet through Ashita v4's packet manager.
+-- @param id number packet id (0x102)
+-- @param bytes table packet bytes
+-- @return boolean true if the packet was queued
+local function dispatch_packet(id, bytes)
+    local ok = pcall(function()
+        AshitaCore:GetPacketManager():AddOutgoingPacket(id, bytes);
     end);
-
-    return sent;
+    return ok;
 end
 
---- Initializes signature scanning for memory offsets and native setter.
--- Searches FFXI's main module ('FFXiMain.dll') with multi-tier fallback.
--- Setting capabilities are universally enabled because packet 0x102 injection works on all clients.
--- @return boolean Success status
--- @return string  Descriptive status message
 --- Locates the client's BLU set point info pointer (independent of the other signatures).
 local function scan_points()
     if points_ptr then return; end
@@ -304,19 +235,15 @@ end
 -- @return number|nil spent set points
 local function read_client_points()
     if not points_ptr then return nil, nil; end
-    local max_pts, spent_pts = nil, nil;
-    pcall(function()
-        local global_addr = ashita.memory.read_uint32(points_ptr);
-        if not global_addr or global_addr == 0 then return; end
-        local info = ashita.memory.read_uint32(global_addr);
-        if not info or info == 0 then return; end
-        max_pts   = ashita.memory.read_uint8(info + 0x18);
-        spent_pts = ashita.memory.read_uint8(info + 0x14);
-    end);
+    local global_addr = ashita.memory.read_uint32(points_ptr);
+    if not global_addr or global_addr == 0 then return nil, nil; end
+    local info = ashita.memory.read_uint32(global_addr);
+    if not info or info == 0 then return nil, nil; end
+    local max_pts = ashita.memory.read_uint8(info + 0x18);
     if not max_pts or max_pts == 0 then
         return nil, nil;
     end
-    return max_pts, spent_pts;
+    return max_pts, ashita.memory.read_uint8(info + 0x14);
 end
 
 --- Handles incoming packets. Captures the BLU "Blue Magic Point Bonus" job point rank from
@@ -341,6 +268,12 @@ function M.handle_packet_in(e)
     end
 end
 
+--- Finds the client addresses VanaBlu needs: the spell buffer offset, the client's spell setter
+-- function and the set point info. Searches FFXiMain.dll first, then the whole process.
+-- Spell changes stay enabled even if the setter is not found, because packets need no signature;
+-- without the buffer offset the equipped spells simply read as empty.
+-- @return boolean always true
+-- @return string status message
 function M.init()
     scan_points();
 
@@ -403,249 +336,103 @@ function M.init()
     return true, M.init_message;
 end
 
---- Helper to check if a 20-byte buffer contains any non-zero Blue Magic spell byte.
-local function has_any_spell(buf)
-    if not buf or type(buf) ~= 'table' or #buf < 20 then return false; end
-    for i = 1, 20 do
-        local v = buf[i] or 0;
-        if v > 0 and v <= 255 then
-            return true;
-        end
-    end
-    return false;
-end
-
---- Reads the 20-byte equipped Blue Magic buffer using atom0s's official blusets pointer traversal.
--- Dereferences the inventory pointer twice (pointer = read_uint32(read_uint32(pInventory)))
--- and applies the 0x04 (main job) or 0xA0 (sub job) offset shift.
--- Multi-tier candidate testing ensures equipped spells are never reported as empty.
--- Reuses reusable_raw_buf in place to guarantee zero garbage collection overhead.
--- @param player object Ashita player memory object
--- @param is_sub boolean true if Blue Mage is sub/support job
--- @return table 20-byte raw spell array
--- @return boolean success status
-local function read_equipped_spells(player, is_sub)
-    local sub_shift = is_sub and 0xA0 or 0x04;
+--- Reads the 20 equipped spell bytes into reusable_raw_buf (the same read as blusets' get_spells()).
+-- Address: [[inventory pointer]] + offset, then +0x04 (BLU main) or +0xA0 (BLU support).
+-- @param is_sub boolean true if BLU is the support job
+-- @return table the 20 spell bytes (0 = empty slot); reused on every call
+-- @return boolean false if the buffer could not be read (offset not found or pointer not ready)
+local function read_equipped_spells(is_sub)
     for i = 1, 20 do reusable_raw_buf[i] = 0; end
-    local success = false;
-
-    -- Method 1: Check player:GetBlueMagic() API if present on the client
-    if player then
-        pcall(function()
-            if player.GetBlueMagic then
-                local bm = player:GetBlueMagic();
-                if type(bm) == 'table' and #bm >= 20 then
-                    for i = 1, 20 do reusable_raw_buf[i] = bm[i] or 0; end
-                    if has_any_spell(reusable_raw_buf) then
-                        success = true;
-                    end
-                end
-            end
-        end);
-        if success then return reusable_raw_buf, true; end
+    if not offset or offset == 0 then
+        return reusable_raw_buf, false;
     end
 
-    -- Method 2: Direct memory read using atom0s's official blusets pointer traversal
-    pcall(function()
-        if not offset or offset == 0 then return; end
-        local pm = AshitaCore:GetPointerManager();
-        if not pm then return; end
+    local ptr = AshitaCore:GetPointerManager():Get('inventory');
+    if not ptr or ptr == 0 then return reusable_raw_buf, false; end
+    local p1 = ashita.memory.read_uint32(ptr);
+    if not p1 or p1 == 0 then return reusable_raw_buf, false; end
+    local p2 = ashita.memory.read_uint32(p1);
+    if not p2 or p2 == 0 then return reusable_raw_buf, false; end
 
-        local ptr = nil;
-        if pm.GetPointer then ptr = pm:GetPointer('inventory'); end
-        if (not ptr or ptr == 0) and pm.Get then ptr = pm:Get('inventory'); end
-        if not ptr or ptr == 0 then return; end
-
-        local p1 = ashita.memory.read_uint32(ptr);
-        if not p1 or p1 == 0 then return; end
-
-        local p2 = ashita.memory.read_uint32(p1);
-
-        -- Priority 1: Double dereference + offset + sub_shift (Official blusets standard!)
-        if p2 and p2 ~= 0 then
-            local addr = (p2 + offset) + sub_shift;
-            local buf = ashita.memory.read_array(addr, 20);
-            if buf and type(buf) == 'table' and #buf >= 20 then
-                for i = 1, 20 do reusable_raw_buf[i] = buf[i] or 0; end
-                success = true;
-                if has_any_spell(reusable_raw_buf) then return; end
-            end
-        end
-
-        -- Priority 2: Double dereference + offset (no sub shift)
-        if p2 and p2 ~= 0 then
-            local addr = p2 + offset;
-            local buf = ashita.memory.read_array(addr, 20);
-            if has_any_spell(buf) then
-                for i = 1, 20 do reusable_raw_buf[i] = buf[i] or 0; end
-                success = true;
-                return;
-            end
-        end
-
-        -- Priority 3: Single dereference + offset + sub_shift (custom private client wrappers)
-        if p1 and p1 ~= 0 then
-            local addr = (p1 + offset) + sub_shift;
-            local buf = ashita.memory.read_array(addr, 20);
-            if has_any_spell(buf) then
-                for i = 1, 20 do reusable_raw_buf[i] = buf[i] or 0; end
-                success = true;
-                return;
-            end
-        end
-
-        -- Priority 4: Single dereference + offset (no sub shift)
-        if p1 and p1 ~= 0 then
-            local addr = p1 + offset;
-            local buf = ashita.memory.read_array(addr, 20);
-            if has_any_spell(buf) then
-                for i = 1, 20 do reusable_raw_buf[i] = buf[i] or 0; end
-                success = true;
-                return;
-            end
-        end
-    end);
-
-    return reusable_raw_buf, success;
+    local buf = ashita.memory.read_array(p2 + offset + (is_sub and 0xA0 or 0x04), 20);
+    if type(buf) ~= 'table' then return reusable_raw_buf, false; end
+    for i = 1, 20 do reusable_raw_buf[i] = buf[i] or 0; end
+    return reusable_raw_buf, true;
 end
 
---- Safely reads the player's BLU job state, level, merit bonuses, and equipped spell buffer.
--- Reuses state_snapshot table in place to ensure zero allocation during normal operation.
--- @return table Player state snapshot, or nil if client is not in game / zoning
--- @return string Error or descriptive status message if unavailable
+-- Zone name cache: the name is looked up only when the zone id changes.
+local cached_zone_id, cached_zone_name = 0, '';
+
+--- Returns the English zone name for a zone id ('' if unknown). A found name is cached until the
+-- zone changes; if the lookup finds nothing it is retried on the next call.
+local function zone_name_for(zone_id)
+    if zone_id ~= cached_zone_id then
+        local name = '';
+        if zone_id > 0 then
+            name = AshitaCore:GetResourceManager():GetString('zones.names', zone_id);
+            if type(name) ~= 'string' then name = ''; end
+        end
+        cached_zone_name = name;
+        if name ~= '' or zone_id == 0 then
+            cached_zone_id = zone_id;
+        end
+    end
+    return cached_zone_name;
+end
+
+--- Reads the player's Blue Mage state and equipped spells. Called every frame while the window is
+-- open, so it allocates no tables: the returned table (and its .raw buffer) is reused.
+-- Callers should wrap it in pcall; it may raise if the client is mid-zone.
+-- @return table|nil player state snapshot, or nil if the player is not loaded (logging in/zoning)
+-- @return string|nil status message when the snapshot is nil
 function M.read()
-    -- Guard 1: Verify player memory structure and entity
-    local player = nil;
-    pcall(function()
-        local mem = AshitaCore:GetMemoryManager();
-        if mem and mem.GetPlayer then
-            player = mem:GetPlayer();
-        end
-    end);
-
+    local mem = AshitaCore:GetMemoryManager();
+    local player = mem:GetPlayer();
     if not player then
-        local entity = nil;
-        pcall(function()
-            if GetPlayerEntity then
-                entity = GetPlayerEntity();
-            end
-        end);
-        if not entity then
-            return nil, 'Logging in or zoning... Waiting for character entity.';
-        end
-        return nil, 'Character memory structure is not ready.';
+        return nil, 'Logging in or zoning... Waiting for character data.';
     end
 
-    -- Guard 2: Query current zone ID and zone name safely via MemoryManager & ResourceManager
-    local current_zone_id = 0;
-    local current_zone_name = '';
-    pcall(function()
-        local mem = AshitaCore:GetMemoryManager();
-        if mem and mem.GetParty then
-            local party = mem:GetParty();
-            if party and party.GetMemberZone then
-                current_zone_id = party:GetMemberZone(0) or 0;
-            end
-        end
-    end);
+    local current_zone_id = mem:GetParty():GetMemberZone(0) or 0;
+    local current_zone_name = zone_name_for(current_zone_id);
 
-    if (not current_zone_id or current_zone_id <= 0) then
-        pcall(function()
-            if AshitaCore.GetDataManager then
-                local dm = AshitaCore:GetDataManager();
-                if dm and dm.GetParty then
-                    local party = dm:GetParty();
-                    if party and party.GetMemberZone then
-                        current_zone_id = party:GetMemberZone(0) or 0;
-                    end
-                end
-            end
-        end);
-    end
-
-    if current_zone_id and current_zone_id > 0 then
-        pcall(function()
-            local rm = AshitaCore:GetResourceManager();
-            if rm and rm.GetString then
-                local z_str = rm:GetString('zones.names', current_zone_id);
-                if z_str and z_str ~= '' then
-                    current_zone_name = z_str;
-                    pcall(function()
-                        local enc = require('gdifonts.encoding');
-                        if enc and enc.ShiftJIS_To_UTF8 then
-                            local u = enc:ShiftJIS_To_UTF8(z_str, true);
-                            if u and u ~= '' then current_zone_name = u; end
-                        end
-                    end);
-                end
-            end
-        end);
-    end
-
-    -- Guard 3: Query main and sub job IDs safely
-    local main_job = 0;
-    local sub_job = 0;
-    pcall(function()
-        main_job = player:GetMainJob() or 0;
-        sub_job = player:GetSubJob() or 0;
-    end);
-
+    local main_job = player:GetMainJob() or 0;
+    local sub_job = player:GetSubJob() or 0;
     local is_main = (main_job == 16);
-    local is_sub = (sub_job == 16);
+    local is_sub = (sub_job == 16) and not is_main;
+    M.blu_active = is_main or is_sub;
 
-    local level = 1;
-    pcall(function()
-        if is_main then
-            level = player:GetMainJobLevel() or 1;
-        elseif is_sub then
-            level = player:GetSubJobLevel() or 1;
-        else
-            level = player:GetMainJobLevel() or 1;
-        end
-    end);
+    local level;
+    if is_sub then
+        level = player:GetSubJobLevel() or 1;
+    else
+        level = player:GetMainJobLevel() or 1;
+    end
 
-    -- If player is not on Blue Mage, allow reference mode without memory reading
-    if not is_main and not is_sub then
+    -- Not on Blue Mage: reference mode (browse only, no memory reads)
+    if not M.blu_active then
         local job_desc = string.format('%s/%s', JOB_NAMES[main_job] or 'Unknown', JOB_NAMES[sub_job] or 'None');
         return make_state(true, false, false, level, 0, 0, 0, reusable_raw_buf, true,
             string.format('Current Job: %s (Reference Mode - Switch to BLU to equip spells).', job_desc), player, current_zone_id, current_zone_name);
     end
 
-    -- Guard 4: Query Blue Mage Merit and Job Point bonuses
-    local assim = 0;
-    pcall(function()
-        if is_main and player.GetAssimilationPoints then
-            assim = player:GetAssimilationPoints() or 0;
-        end
-    end);
-
-    -- Blue Magic Point Bonus (job points): Ashita v4 exposes no per-category job point API, so the
-    -- rank is captured from incoming packet 0x08D (see M.handle_packet_in). Main job only.
-    local bp_bonus = 0;
-    local jp = 0;
-    pcall(function()
-        if is_main and player.GetJobPointsSpent then
-            jp = player:GetJobPointsSpent(16) or 0;
-        end
-    end);
-    if is_main and M.jp_bp_bonus then
-        bp_bonus = M.jp_bp_bonus;
+    -- Merits and job points only apply to main-job BLU
+    local assim, jp, bp_bonus = 0, 0, 0;
+    if is_main then
+        assim = player:GetAssimilationPoints() or 0;
+        jp = player:GetJobPointsSpent(16) or 0;
+        -- Ashita v4 has no per-job-point API, so the Blue Magic Point Bonus rank comes from
+        -- incoming packet 0x08D (see M.handle_packet_in).
+        bp_bonus = M.jp_bp_bonus or 0;
     end
 
-    -- Authoritative set point totals as computed by the game client (includes merits + job points)
+    -- Set point totals computed by the game client itself (include merits and job points)
     local client_max, client_spent = read_client_points();
 
-    -- Guard 5: Read raw equipped spell buffer (20 bytes) using blusets double-dereference method
-    local raw, read_success = read_equipped_spells(player, is_sub);
+    local raw, read_success = read_equipped_spells(is_sub);
 
-    local state;
-    if not read_success then
-        state = make_state(true, true, is_main, level, assim, bp_bonus, jp, raw, true,
-            'Equipped spells not cached yet. Open the in-game Blue Magic menu once to initialize.', player, current_zone_id, current_zone_name);
-    else
-        state = make_state(true, true, is_main, level, assim, bp_bonus, jp, raw, true,
-            'Ready', player, current_zone_id, current_zone_name);
-    end
+    local state = make_state(true, true, is_main, level, assim, bp_bonus, jp, raw, true,
+        read_success and 'Ready' or 'Equipped spells not cached yet. Open the in-game Blue Magic menu once to initialize.',
+        player, current_zone_id, current_zone_name);
     state.client_max_points   = client_max or 0;
     state.client_spent_points = client_spent or 0;
     return state;
@@ -686,13 +473,21 @@ function M.read_learned(player, spellinfo)
     return learned;
 end
 
---- Equips or unsets an individual spell in a specific slot via authoritative packet 0x102.
+--- Error returned by the spell-changing functions when Blue Mage is not the main or support job.
+local NOT_BLU_MSG = 'Switch to Blue Mage (main or support job) to change spells.';
+
+--- Equips or unsets one spell in one slot.
+-- Sends a 0x102 packet and, when the client setter was found, also calls it (see build_unset_packet
+-- for why both are needed when unsetting). Equipping is throttled to one change per write_cooldown.
 -- @param slot number 1-indexed slot number (1 to 20)
 -- @param spell_id number Full spell ID (e.g. 513), or 0 to clear/remove the slot
--- @param is_main boolean indicating whether BLU is main job
+-- @param is_main boolean true if BLU is the main job, false if it is the support job
 -- @return boolean Success status
 -- @return string Error message if operation failed or is on cooldown
 function M.set_spell(slot, spell_id, is_main)
+    if not M.blu_active then
+        return false, NOT_BLU_MSG;
+    end
     local is_equipping = (spell_id and spell_id > 0);
     local now = os.clock();
 
@@ -706,16 +501,14 @@ function M.set_spell(slot, spell_id, is_main)
     local byte_id = is_equipping and (spell_id - 512) or 0;
     local is_sub = (is_main == false);
 
-    -- 1. Dispatch authoritative network packet 0x102 (matching blusets)
-    local p_str, p_tbl = nil, nil;
+    -- 1. Send the 0x102 packet
     if is_equipping then
-        p_str, p_tbl = build_set_packet(spell_id, slot_1based, is_sub);
+        dispatch_packet(0x102, build_set_packet(spell_id, slot_1based, is_sub));
     else
-        p_str, p_tbl = build_unset_packet(slot_1based, is_sub);
+        dispatch_packet(0x102, build_unset_packet(slot_1based, is_sub));
     end
-    dispatch_packet(0x102, p_str, p_tbl);
 
-    -- 2. Auxiliary call to native setter if mapped
+    -- 2. Also call the client's own setter, if found
     if setter then
         local main_flag = is_sub and 1 or 0;
         pcall(setter, main_flag, 0x1000, slot_1based - 1, byte_id);
@@ -728,14 +521,17 @@ function M.set_spell(slot, spell_id, is_main)
     return true, nil;
 end
 
---- Initiates unsetting all spells.
--- Sends atom0s's official batch reset packet 0x102 immediately, clearing all 20 slots
--- in one atomic server transaction. Also queues sequential slot unsets as reinforcement.
--- @param is_main boolean indicating whether BLU is main job
+--- Starts unsetting all spells.
+-- Sends one clear-all packet listing the equipped spells (build_reset_all_packet), then queues a
+-- per-slot unset for all 20 slots, which tick_unset_queue() sends one every unset_cooldown seconds.
+-- @param is_main boolean true if BLU is the main job, false if support, nil if unknown (treated as main)
 -- @param equipped_slots table optional list or map of currently equipped slot IDs (1-indexed)
 -- @return boolean Success status
 -- @return string Status message
 function M.unset_all(is_main, equipped_slots)
+    if not M.blu_active then
+        return false, NOT_BLU_MSG;
+    end
     if M.is_equipping_set then
         M.cancel_equip();
     end
@@ -753,18 +549,17 @@ function M.unset_all(is_main, equipped_slots)
         end
     end
 
-    -- 1. Dispatch authoritative blusets reset_all_spells packet 0x102 immediately!
-    local p_str, p_tbl = build_reset_all_packet(raw_spells, is_sub);
-    dispatch_packet(0x102, p_str, p_tbl);
+    -- 1. Clear-all packet
+    dispatch_packet(0x102, build_reset_all_packet(raw_spells, is_sub));
 
-    -- 2. Call native client sentinels if mapped
+    -- 2. Client setter calls with slot indexes 0xFF and 20 (outside the 0-19 slot range)
     if setter then
         local main_flag = is_sub and 1 or 0;
         pcall(setter, main_flag, 0x1000, 0xFF, 0);
         pcall(setter, main_flag, 0x1000, 20, 0);
     end
 
-    -- 3. Queue individual slot unsets as sequential pump
+    -- 3. Queue a per-slot unset for every slot (sent by tick_unset_queue)
     M.unset_queue = {};
     for slot = 1, 20 do
         table.insert(M.unset_queue, slot);
@@ -776,11 +571,10 @@ function M.unset_all(is_main, equipped_slots)
     return true, 'Clearing all equipped Blue Magic spells...';
 end
 
---- Services the asynchronous unset queue across frame ticks in d3d_present.
--- Throttles unsetting requests by M.unset_cooldown (0.75s) so that FFXI server
--- packet handlers properly process each slot removal without drops.
--- @param is_main boolean indicating whether BLU is main job
--- @param raw_slots table of 20 bytes representing client memory equipped buffer (optional)
+--- Services the unset queue; called every frame from d3d_present.
+-- Sends at most one slot unset every unset_cooldown (0.75s) seconds.
+-- @param is_main boolean|nil BLU main (true) / support (false); nil keeps the job unset_all() started with
+-- @param raw_slots table current equipped spell bytes (currently unused)
 -- @return boolean True if clearing completed
 -- @return string Status message when completed
 function M.tick_unset_queue(is_main, raw_slots)
@@ -799,11 +593,11 @@ function M.tick_unset_queue(is_main, raw_slots)
     end
 
     local slot_1based = table.remove(M.unset_queue, 1);
-    local is_sub = ((is_main ~= nil and is_main or M.unset_target_main) == false);
+    if is_main == nil then is_main = M.unset_target_main; end
+    local is_sub = (is_main == false);
 
     if slot_1based then
-        local p_str, p_tbl = build_unset_packet(slot_1based, is_sub);
-        dispatch_packet(0x102, p_str, p_tbl);
+        dispatch_packet(0x102, build_unset_packet(slot_1based, is_sub));
 
         if setter then
             local main_flag = is_sub and 1 or 0;
@@ -820,12 +614,12 @@ function M.tick_unset_queue(is_main, raw_slots)
     return false, nil;
 end
 
---- Initiates equipping a saved set using blusets's clean atomic reset-and-set architecture.
--- 1. Instantly clears all equipped spells via the batch reset packet 0x102 (no slot collisions,
---    no duplicate spell errors, no BP overflow).
--- 2. Pauses for 1.25s post-reset settle delay to ensure the server completely finishes unsetting
---    before receiving the first spell.
--- 3. Paces subsequent spell additions into slots 1..N at 0.75s intervals.
+--- Starts equipping a saved set.
+-- 1. Sends one clear-all packet listing the equipped spells, so set spells can't collide with
+--    spells already in other slots or exceed the set point limit while loading.
+-- 2. Waits post_reset_delay (1.25s) for the server to process it before the first spell.
+-- 3. Queues one set per spell into slots 1..N; tick_equip_queue() sends one every write_cooldown (0.75s).
+-- Returns false without doing anything if the set is already equipped in the same slots.
 -- @param target_spells table array of spell IDs to equip (1-indexed)
 -- @param set_name string name of the set being equipped
 -- @param is_main boolean indicating whether BLU is main job
@@ -833,6 +627,9 @@ end
 -- @return boolean Success status
 -- @return string Status message
 function M.start_equip_set(target_spells, set_name, is_main, equipped_slots)
+    if not M.blu_active then
+        return false, NOT_BLU_MSG;
+    end
     if not target_spells or #target_spells == 0 then
         return false, 'Saved set contains no valid spells.';
     end
@@ -867,7 +664,7 @@ function M.start_equip_set(target_spells, set_name, is_main, equipped_slots)
     local is_sub = (is_main == false);
     M.equip_target_main = (is_main ~= false);
 
-    -- 1. Dispatch blusets batch reset packet 0x102 to clear all current spells first
+    -- 1. Clear-all packet (plus the same client setter calls as unset_all)
     local raw_spells = {};
     if type(equipped_slots) == 'table' then
         for i = 1, 20 do
@@ -876,8 +673,7 @@ function M.start_equip_set(target_spells, set_name, is_main, equipped_slots)
             raw_spells[i] = val;
         end
     end
-    local p_str, p_tbl = build_reset_all_packet(raw_spells, is_sub);
-    dispatch_packet(0x102, p_str, p_tbl);
+    dispatch_packet(0x102, build_reset_all_packet(raw_spells, is_sub));
 
     if setter then
         local main_flag = is_sub and 1 or 0;
@@ -914,10 +710,9 @@ function M.cancel_equip()
     return true, 'Equip operation cancelled.';
 end
 
---- Services the set-equipping queue frame-by-frame in d3d_present.
--- Enforces a 1.25s post-reset settle delay before sending the first spell,
--- followed by 0.75s pacing between consecutive packet transmissions.
--- @param is_main boolean indicating whether BLU is main job
+--- Services the set-equipping queue; called every frame from d3d_present.
+-- Waits post_reset_delay (1.25s) before the first spell, then write_cooldown (0.75s) between spells.
+-- @param is_main boolean|nil BLU main (true) / support (false); nil keeps the job start_equip_set() started with
 -- @return boolean True if finished
 -- @return string Status message if state changed
 function M.tick_equip_queue(is_main)
@@ -940,13 +735,13 @@ function M.tick_equip_queue(is_main)
     M.equip_is_first_action = false;
 
     local action = table.remove(M.equip_queue, 1);
-    local is_sub = ((is_main ~= nil and is_main or M.equip_target_main) == false);
+    if is_main == nil then is_main = M.equip_target_main; end
+    local is_sub = (is_main == false);
     local slot = action.slot;
     local spell_byte = action.spell_byte;
 
-    -- Dispatch packet 0x102 for this slot
-    local p_str, p_tbl = build_set_packet(action.spell_id, slot, is_sub);
-    dispatch_packet(0x102, p_str, p_tbl);
+    -- Set packet for this slot, plus the client setter call
+    dispatch_packet(0x102, build_set_packet(action.spell_id, slot, is_sub));
 
     if setter then
         local main_flag = is_sub and 1 or 0;

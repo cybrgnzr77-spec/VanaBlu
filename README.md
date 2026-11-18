@@ -21,6 +21,26 @@ Evolved from the original Windower 4 `bluGuide` addon by **Anissa**, VanaBlu add
 - **Light on the game**:
   - While the window is closed and no set is loading, VanaBlu does no memory reads and no drawing.
   - While it is open, drawing a frame allocates almost no memory, so it does not cause garbage-collection stutter.
+---
+
+
+## Screens
+
+<img width="1555" height="921" alt="vb1" src="https://github.com/user-attachments/assets/b336e88c-d152-4c0f-95a7-9a88e716401c" />
+
+<img width="1555" height="921" alt="vb2" src="https://github.com/user-attachments/assets/7d9bcc84-6214-49d7-9289-6e7aa5465515" />
+
+<img width="1551" height="920" alt="vb3" src="https://github.com/user-attachments/assets/eadb923c-6f04-479a-b3b1-6e4864141dbd" />
+
+<img width="1556" height="925" alt="vb4" src="https://github.com/user-attachments/assets/f11af06e-e16a-452c-948a-9e174e21db91" />
+
+<img width="1557" height="923" alt="vb5" src="https://github.com/user-attachments/assets/6f255551-b474-4ae2-b800-9ea3aa27e928" />
+
+<img width="1384" height="1043" alt="vb5-2" src="https://github.com/user-attachments/assets/c4126090-8c92-473e-aee8-d6e135dcc272" />
+
+<img width="1554" height="924" alt="vb6" src="https://github.com/user-attachments/assets/80edba7c-70c0-4c38-8391-00e0add97eb8" />
+
+<img width="1559" height="925" alt="vb7" src="https://github.com/user-attachments/assets/9b48bc09-1cb1-40c9-a33f-c58e0eb021e2" />
 
 ---
 

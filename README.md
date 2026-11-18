@@ -1,4 +1,4 @@
-# VanaBlu for Ashita v4 (v1.0)
+# VanaBlu for Ashita v4 (v1.0.1)
 
 **VanaBlu** is a comprehensive, interactive Blue Magic spell, job trait, skillchain, and spell-hunting guide for Final Fantasy XI, built natively for **Ashita v4**.
 
@@ -23,11 +23,30 @@ Evolved from the original Windower 4 `bluGuide` addon by **Anissa**, VanaBlu has
   - Corrected Blue Magic Set Point (BP) costs (Seedspray 2 BP, Charged Whisker 4 BP, Foul Waters 4 BP, Sweeping Gouge 6 BP, Retinal Glare 5 BP).
   - Accurate skillchain properties (including secondary Impaction on Uppercut, Goblin Rush, and Thrashing Assault; Distortion/Scission on Quad. Continuum; Induration on Sweeping Gouge; Detonation on Sudden Lunge).
   - Complete job trait mappings with exact point contributions (including 6-point values for tier-4/5 traits).
-  - Obtainment & Hunting database (`res/hunting.lua`) with real retail monster names, exact level ranges, and verified sub-map coordinates—eliminating generic placeholders and fabricated mobs.
+  - Spell Tracker database (`res/hunting.lua`) built from the server's own spell-to-monster-move mappings and LandSandBoat spawn data: which monsters teach each spell, in which zones, at what levels, under what conditions (NM, night, weather, Dynamis, Odyssey...), plus the distance and direction to the nearest known spawn while you are in that zone. See *Spell Tracker Data* below.
 - **Zero-CPU Idle Optimization**:
   - Automatically bypasses all memory polling and rendering routines when the window is closed and no background queue is active, consuming 0% idle CPU.
 - **Zero Per-Frame Garbage Allocation**:
   - All temporary buffers, tables, and state snapshots are pre-allocated and reused in place across frame cycles.
+
+---
+
+## Changelog
+
+### v1.0.1
+- **Fixed:** Maximum Blue Magic Set Points stopped at 60 for level 99 characters. The Blue Magic Point Bonus job points (up to +20 BP) were never read, because the Ashita v4 call the addon relied on does not exist. The maximum (up to 80 BP: 55 base + 5 Assimilation merits + 20 job points) is now read directly from the game client, the same value the in-game Set Blue Magic menu shows. If that value is unavailable, the job point rank is captured from the server's job point packet (`0x08D`) instead.
+- Hovering the level line under "Set Points" now shows the breakdown (base, merits, job points) and where the maximum came from.
+- **Fixed:** Saved spell sets were wiped whenever the addon was updated, because the database lived in the addon folder and each release shipped an empty `saved_sets.lua`. Sets are now stored in `config/addons/vanablu/saved_sets.lua`, which updates never touch. The release no longer includes a `saved_sets.lua`, and sets from older versions are migrated automatically on first load (see *Updating & Saved Sets*).
+- Saved sets are no longer duplicated into the per-character settings file. That duplicate copy could bring back sets you had deleted.
+- `/vanablu list` now also shows where the saved sets file is stored.
+- **Spell Tracker rebuilt for accuracy:** about a third of the old tracker's monster/zone entries pointed to monsters that don't teach the spell on VanaDreams, or to the wrong zone. The new data comes from the server's own spell mappings plus LandSandBoat spawn data (see *Spell Tracker Data*). Changes:
+  - 18 Unbridled Learning spells added (196 spells total).
+  - Monster levels, spawn conditions (NM, night, weather, fished, Dynamis, instance, battlefield) and per-spell notes, such as "only used at 50% HP or lower".
+  - Spells that are Odyssey-only or not currently learnable on VanaDreams are flagged.
+  - The Blue Magic skill required to learn each spell is shown next to your current skill.
+  - The "Current Zone only" filter matches by zone ID, using the game's own zone names.
+  - While you're in a listed zone, each monster shows the distance and compass direction to its nearest known spawn. This replaces the old map grid coordinates, most of which could not be verified.
+  - The Help tab lists the server's learning rules.
 
 ---
 
@@ -46,7 +65,8 @@ Evolved from the original Windower 4 `bluGuide` addon by **Anissa**, VanaBlu has
            ├── vanablu.lua
            ├── backend.lua
            ├── model.lua
-           ├── saved_sets.lua
+           ├── setstore.lua
+           ├── tracker.lua
            ├── README.md
            ├── LICENSE
            └── res/
@@ -59,6 +79,25 @@ Evolved from the original Windower 4 `bluGuide` addon by **Anissa**, VanaBlu has
    /addon load vanablu
    ```
 4. *(Optional)* To load automatically when launching Ashita, add `/addon load vanablu` to your default startup script (`scripts/default.txt`).
+
+### Spell Tracker Data
+The tracker covers every spell learnable on VanaDreams (196, including the 18 Unbridled Learning spells, which cannot be set). It was built from:
+1. **VanaDreams' live-server mapping extract (2026-11-13)**: which enemy move teaches each spell, and which monster skill lists contain that move. This is the authority for *what* teaches a spell on this server.
+2. **The LandSandBoat repository** (the server's code base): which monsters use those skill lists, where they spawn, their levels, spawn conditions, and move-script restrictions (for example, Final Sting is only used at 50% HP or lower).
+3. **BG-Wiki / FFXIclopedia (retail)**: only for spells whose VanaDreams skill lists don't exist in the public code. These entries are labelled *"location from wiki (retail), not confirmed on this server"*.
+
+Each spell also shows the Blue Magic skill the server requires to learn it, alongside your current skill. Spells the server cannot currently teach are marked as such: the enemy move has no action script (Retinal Glare, Sinker Drill, Plenilune Embrace), or it only works inside Odyssey (Sheol Gaol).
+
+Spawn data comes from the public LandSandBoat code, so a server with custom spawns may differ in places. Please report anything that doesn't match what you see in game.
+
+### Updating & Saved Sets
+Saved spell sets are stored outside the addon folder, in:
+```text
+<Ashita Directory>/config/addons/vanablu/saved_sets.lua
+```
+Updating the addon (extracting a new release over `addons/vanablu/`) never touches this file, so your sets are kept. Back up this file if you want a copy of your sets.
+
+Upgrading from v1.0: older versions kept sets in `addons/vanablu/saved_sets.lua`. The first time v1.0.1 loads, those sets (and any copy in your per-character settings file) are moved to the config folder automatically, and the old file is renamed to `saved_sets.lua.migrated`. Extract v1.0.1 over your existing folder instead of deleting the folder first, so the old file is still there to migrate.
 
 ---
 

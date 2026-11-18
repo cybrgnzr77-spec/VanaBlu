@@ -13,7 +13,16 @@ M.gift_exempt_traits = {
     ['Gilfinder/Treasure Hunter'] = true,
 }
 
-function M.get_limits(level, is_main, assimilation_points, blue_point_bonus, jp_spent)
+--- Computes BLU slot / set point (BP) / gift limits.
+-- Set point maximum (matches LandSandBoat blueutils::GetTotalBlueMagicPoints):
+--   base: 10 BP at Lv.1-10, +5 per 10 levels, 55 BP at Lv.91-99
+--   +1 BP per Assimilation merit (max 5) at Lv.75+
+--   +1 BP per Blue Magic Point Bonus job point rank (max 20) at Lv.99
+--   => 80 BP maximum.
+-- If the game client's own computed maximum is available (client_max_points > 0) it is used
+-- as the authoritative value, since it already includes every merit and job point bonus.
+-- @param client_max_points number|nil max set points read from client memory (0/nil = unknown)
+function M.get_limits(level, is_main, assimilation_points, blue_point_bonus, jp_spent, client_max_points)
     level = math.min(99, math.max(1, level or 1))
     assimilation_points = math.min(5, math.max(0, assimilation_points or 0))
     blue_point_bonus = math.min(20, math.max(0, blue_point_bonus or 0))
@@ -31,15 +40,28 @@ function M.get_limits(level, is_main, assimilation_points, blue_point_bonus, jp_
     end
 
     -- Base Set Points: 10 BP at Lv.1 up to 55 BP at Lv.91-99
-    points = (math.floor((level + 9) / 10) * 5) + 5
+    local base_points = (math.floor((level + 9) / 10) * 5) + 5
+    local merit_points = 0
+    local jp_points = 0
 
     -- Assimilation merits apply if character level reaches 75+
     if level >= 75 then
-        points = points + math.min(5, math.max(0, assimilation_points))
+        merit_points = assimilation_points
         -- Level 99 Job Point bonus (up to +20 BP)
         if level == 99 then
-            points = points + math.min(20, math.max(0, blue_point_bonus))
+            jp_points = blue_point_bonus
         end
+    end
+
+    local calculated_points = base_points + merit_points + jp_points
+    points = calculated_points
+
+    -- Prefer the client's own computed maximum when it is available
+    local points_source = 'calculated'
+    client_max_points = tonumber(client_max_points) or 0
+    if client_max_points > 0 then
+        points = client_max_points
+        points_source = 'client'
     end
 
     -- Level 99 Job Point gift tier bonuses (+1 at 100 JP, +2 at 1200 JP)
@@ -58,7 +80,14 @@ function M.get_limits(level, is_main, assimilation_points, blue_point_bonus, jp_
         points = points,
         gifts = gifts,
         level = level,
-        is_main = is_main
+        is_main = is_main,
+        base_points = base_points,
+        bonus_points = points - base_points,   -- everything above the level-based base
+        merit_points = merit_points,
+        jp_points = jp_points,
+        calculated_points = calculated_points,
+        points_source = points_source,          -- 'client' (read from game) or 'calculated'
+        jp_spent = jp_spent,
     }
 end
 

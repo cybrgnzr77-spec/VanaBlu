@@ -23,7 +23,7 @@
 
 addon.name    = 'vanablu';
 addon.author  = 'Anissa (original bluGuide) / Ashita v4 port & VanaBlu enhancements';
-addon.version = '1.0';
+addon.version = '1.0.1';
 addon.desc    = 'Interactive Blue Magic spell, trait, skillchain, and hunting guide for Ashita v4.';
 addon.link    = 'https://github.com/mverteuil/windower4-addons/tree/master/vanablu';
 
@@ -34,6 +34,8 @@ local model   = require('model');
 local spells  = require('res.spellinfo');
 local traits  = require('res.traits');
 local hunting = require('res.hunting');
+local setstore = require('setstore');
+local tracker = require('tracker');
 
 -- =============================================================================
 -- GUI State & Navigation
@@ -56,6 +58,7 @@ local gui = {
     cached_lim_assim      = -1,
     cached_lim_bp         = -1,
     cached_lim_jp         = -1,
+    cached_lim_client_max = -1,
     cached_equipped_state = nil,      -- Cached equipped state (recomputed only when memory buffer changes)
     last_raw_buf             = nil,      -- Snapshot of last frame's 20-byte spell buffer
     filter_learned_only      = { false },
@@ -96,9 +99,9 @@ end
 local settings = nil;
 pcall(function() settings = require('settings'); end);
 
-local default_settings = {
-    saved_sets = {},
-};
+-- Per-character settings (Ashita settings library). Saved sets are NOT stored here anymore; any
+-- saved_sets table left in an existing settings file is only read once for migration.
+local default_settings = {};
 
 local addon_settings = nil;
 if settings and settings.load then
@@ -135,76 +138,73 @@ local function get_addon_dir()
     return path;
 end
 
+-- Saved sets are stored in <Ashita>\config\addons\vanablu\saved_sets.lua (see setstore.lua) so that
+-- updating the addon never overwrites them. Sets from the old addon-folder file are migrated
+-- automatically on first load.
 local function load_saved_sets()
-    local sets = {};
+    local install_path = '';
+    pcall(function() install_path = AshitaCore:GetInstallPath() or ''; end);
 
-    -- 1. Try Ashita settings
-    if addon_settings and addon_settings.saved_sets and type(addon_settings.saved_sets) == 'table' then
-        for k, v in pairs(addon_settings.saved_sets) do
-            if type(v) == 'table' and v.spells then
-                sets[k] = { name = v.name or k, spells = v.spells };
-            end
-        end
+    setstore.init({
+        addon_name   = addon.name,
+        install_path = install_path,
+        addon_dir    = get_addon_dir(),
+    });
+
+    local sets = setstore.load();
+    for _, set in pairs(sets) do
+        set.total_bp = model.calculate_set_bp(set.spells, spells);
     end
-
-    -- 2. Try saved_sets.lua file
-    local dir = get_addon_dir();
-    local file_path = dir .. 'saved_sets.lua';
-    local ok, chunk = pcall(loadfile, file_path);
-    if ok and type(chunk) == 'function' then
-        local run_ok, data = pcall(chunk);
-        if run_ok and type(data) == 'table' then
-            for k, v in pairs(data) do
-                if type(v) == 'table' and v.spells then
-                    sets[k] = { name = v.name or k, spells = v.spells };
-                end
-            end
-        end
-    end
-
     return sets;
 end
 
 local function save_saved_sets(sets)
-    -- 1. Sync to Ashita settings
-    if addon_settings then
-        addon_settings.saved_sets = sets;
-        if settings and settings.save then
-            pcall(function() settings.save(); end);
-        end
-    end
-
     gui.saved_sets_dirty = true;
-
-    -- 2. Write to saved_sets.lua
-    local dir = get_addon_dir();
-    local file_path = dir .. 'saved_sets.lua';
-    local f, err = io.open(file_path, 'w');
-    if f then
-        f:write('-- VanaBlu Saved Sets Database\n');
-        f:write('return {\n');
-        for name, data in pairs(sets) do
-            f:write(string.format('    [%q] = {\n', name));
-            f:write(string.format('        name = %q,\n', data.name or name));
-            f:write('        spells = { ');
-            if data.spells then
-                for _, id in ipairs(data.spells) do
-                    f:write(string.format('%d, ', id));
-                end
-            end
-            f:write('},\n');
-            f:write('    },\n');
-        end
-        f:write('};\n');
-        f:close();
-        return true;
-    else
-        return false, err;
-    end
+    return setstore.save(sets);
 end
 
 -- Initialize saved sets from storage
 gui.saved_sets = load_saved_sets();
+
+--- Older versions also copied every saved set into the per-character settings file
+--- (config\addons\vanablu\<Character>_<id>\settings.lua). Those copies survive addon updates, so
+--- they can restore sets lost by earlier updates. Each copy is imported once (sets already in the
+--- database are never overwritten) and then removed from the settings file, so a set deleted later
+--- cannot reappear from a stale copy.
+local function absorb_settings_sets(s)
+    if type(s) ~= 'table' or type(s.saved_sets) ~= 'table' then
+        return;
+    end
+
+    local added = setstore.merge_missing(gui.saved_sets, s.saved_sets);
+    if added > 0 then
+        for _, set in pairs(gui.saved_sets) do
+            set.total_bp = set.total_bp or model.calculate_set_bp(set.spells, spells);
+        end
+        local ok = save_saved_sets(gui.saved_sets);
+        if not ok then
+            return; -- keep the settings copy; try again next time
+        end
+        print(string.format('[VanaBlu] Recovered %d saved set%s from your character settings.', added, added == 1 and '' or 's'));
+    end
+
+    s.saved_sets = nil;
+    if settings and settings.save then
+        pcall(function() settings.save(); end);
+    end
+end
+
+absorb_settings_sets(addon_settings);
+
+-- The settings library loads each character's settings file after login / on character change.
+if settings and settings.register then
+    pcall(function()
+        settings.register('settings', 'vanablu_settings_update', function(s)
+            addon_settings = s;
+            absorb_settings_sets(s);
+        end);
+    end);
+end
 
 -- Pre-sorted lists
 local ordered_spells = {};
@@ -338,23 +338,6 @@ end
 local spell_traits_map = {};
 
 -- Initialize and sort master data structures once, and precompute static display strings
---- Determines if a zone name indicates a Wings of the Goddess past (Shadowreign) zone.
---- Returns true for zone names ending in (S), [S], or standalone 's' (e.g. 'Jugner Forest (S)').
-local function is_past_zone(name)
-    if not name then return false; end
-    local lower = name:lower();
-    return (lower:find('%(s%)') ~= nil) or (lower:find('%[s%]') ~= nil) or (lower:find('%s+s$') ~= nil);
-end
-
---- Normalizes a zone name by stripping any past indicators and removing non-alphanumeric chars.
---- This produces an identical base string for both 'Jugner Forest' and 'Jugner Forest (S)' -> 'jugnerforest'.
-local function clean_zone_base(name)
-    if not name then return ''; end
-    local s = name:lower();
-    s = s:gsub('%(s%)', ''):gsub('%[s%]', ''):gsub('%s+s$', '');
-    return s:gsub('%W', '');
-end
-
 local function initialize_data()
     for _, sp in pairs(spells) do
         table.insert(ordered_spells, sp);
@@ -393,13 +376,6 @@ local function initialize_data()
         sp.elem_tag = ELEMENT_TAGS[sp.element] or '[???]';
         sp.all_ctx = 'all_' .. sp.id;
         sp.id_str = tostring(sp.id);
-        sp.tracker_header_learned = string.format('[Lv.%2d] %-22s  [LEARNED]###tracker_sp_%d', sp.level, sp.name, sp.id);
-        sp.tracker_header_unlearned = string.format('[Lv.%2d] %-22s  [NOT LEARNED]###tracker_sp_%d', sp.level, sp.name, sp.id);
-
-        local hunt = hunting[sp.id] or { family = 'Unknown', stats = 'None', zones = {} };
-        sp.tracker_summary = string.format('Level: %d   |   Set Cost: %d BP   |   Element: %s   |   Family: %s',
-            sp.level, sp.cost or 0, ELEMENT_NAMES[sp.element] or 'Unknown', hunt.family or 'Unknown');
-        sp.tracker_attributes = string.format('Attributes: %s', (hunt.stats and hunt.stats ~= '') and hunt.stats or 'None');
 
         -- Precompute traits summary for tracker
         local tr_list = spell_traits_map[sp.id] or {};
@@ -451,50 +427,6 @@ local function initialize_data()
             sp.tip_proc_text = '';
         end
 
-        -- Precompute structured hunting zones on spell for instant past-aware O(1) zone filtering
-        sp.hunting_zones = {
-            present = {},
-            present_list = {},
-            past = {},
-            past_list = {},
-        };
-        sp.hunting_zones_norm = {};
-        if hunt.zones and #hunt.zones > 0 then
-            for _, z in ipairs(hunt.zones) do
-                if z.zone then
-                    local z_lower = z.zone:lower();
-                    sp.hunting_zones_norm[z_lower] = true;
-                    local z_clean = z_lower:gsub('%W', '');
-                    sp.hunting_zones_norm[z_clean] = true;
-
-                    local is_past = is_past_zone(z.zone);
-                    local clean = clean_zone_base(z.zone);
-                    if is_past then
-                        sp.hunting_zones.past[clean] = true;
-                        table.insert(sp.hunting_zones.past_list, clean);
-                    else
-                        sp.hunting_zones.present[clean] = true;
-                        table.insert(sp.hunting_zones.present_list, clean);
-                    end
-                end
-            end
-        end
-
-        -- Precompute hunting zones headers and mob bullet strings
-        if hunt.zones and #hunt.zones > 0 then
-            hunt.zones_header = string.format('Learning Locations (%d Zone%s):', #hunt.zones, #hunt.zones == 1 and '' or 's');
-            for _, z_entry in ipairs(hunt.zones) do
-                z_entry.header = string.format('%s (%d Mob%s)###tr_z_%d_%s',
-                    z_entry.zone, #z_entry.mobs, #z_entry.mobs == 1 and '' or 's', sp.id, z_entry.zone);
-                if z_entry.mobs then
-                    for _, m in ipairs(z_entry.mobs) do
-                        m.bullet_text = string.format('%s  |  Level: %s  |  Map Coordinates: %s', m.name, m.level, m.coords);
-                    end
-                end
-            end
-        else
-            hunt.zones_header = 'Learning Locations (0 Zones):';
-        end
     end
 
     -- Precompute category spell lists, headers, and item contexts
@@ -569,6 +501,9 @@ local function initialize_data()
 end
 
 initialize_data();
+
+-- Spell Tracker list (includes Unbridled Learning spells, which are not in res/spellinfo.lua)
+tracker.build(hunting, spells);
 
 -- =============================================================================
 -- Safe ImGui Adapter Functions & Lifecycle Tracking
@@ -976,50 +911,30 @@ local function render_all_spells_view(equipped_state, limits, learned_map, is_ma
     end
 end
 
---- Checks whether a spell is available to learn in the specified zone.
---- Distinguishes Wings of the Goddess past (Shadowreign) zones from present-day counterparts:
---- e.g., 'Jugner Forest (S)' will NEVER match present-day 'Jugner Forest', and vice versa.
-local function is_spell_in_zone(sp, zone_name)
-    if not zone_name or zone_name == '' then return true; end
-    if not sp or not sp.hunting_zones then return false; end
-
-    local target_is_past = is_past_zone(zone_name);
-    local target_clean = clean_zone_base(zone_name);
-    if target_clean == '' then return true; end
-
-    local zone_map = target_is_past and sp.hunting_zones.past or sp.hunting_zones.present;
-    if zone_map and zone_map[target_clean] then
-        return true;
-    end
-
-    local zone_list = target_is_past and sp.hunting_zones.past_list or sp.hunting_zones.present_list;
-    if zone_list then
-        for _, z_clean in ipairs(zone_list) do
-            if z_clean:find(target_clean, 1, true) or target_clean:find(z_clean, 1, true) then
-                return true;
-            end
-        end
-    end
-
-    return false;
-end
-
---- Tab 6: Interactive Spell Obtainment & Mob Hunting Tracker
+--- Tab 6: Spell Tracker (learning sources for VanaDreams)
+-- Data comes from res/hunting.lua via tracker.lua: zones are matched by zone id, and while you are in
+-- a listed zone each monster line shows the distance/direction to its nearest known spawn point.
 local function render_spell_tracker_view(equipped_state, limits, learned_map, is_main, player_data)
-    -- Use pre-calculated learned count from cached memory scan
-    local total_count = #ordered_spells;
+    local entries = tracker.entries;
+    local total_count = #entries;
     local learned_count = gui.cached_learned_count or 0;
 
     local progress_pct = (total_count > 0) and (learned_count / total_count) or 0;
     safe_progress_bar(progress_pct, -1, 22, string.format('Learned Spells: %d / %d (%.1f%%)', learned_count, total_count, progress_pct * 100));
+
+    -- Player Blue Magic skill (for the per-spell skill requirement)
+    local my_skill = nil;
+    if player_data and player_data.player then
+        my_skill = tracker.blue_magic_skill(player_data.player);
+    end
     imgui.Spacing();
 
     -- High-visibility styling for search box and filter checkboxes
     safe_push_style_color(ImGuiCol_FrameBg or 7, 0.16, 0.22, 0.35, 1.0);
     safe_push_style_color(ImGuiCol_FrameBgHovered or 8, 0.24, 0.35, 0.55, 1.0);
     safe_push_style_color(ImGuiCol_FrameBgActive or 9, 0.28, 0.42, 0.68, 1.0);
-    safe_push_style_color(ImGuiCol_CheckMark or 18, 0.30, 1.0, 0.45, 1.0); -- Bright neon-green checkmark
-    safe_push_style_color(ImGuiCol_Border or 5, 0.40, 0.65, 0.95, 0.90);  -- Crisp visible border
+    safe_push_style_color(ImGuiCol_CheckMark or 18, 0.30, 1.0, 0.45, 1.0);
+    safe_push_style_color(ImGuiCol_Border or 5, 0.40, 0.65, 0.95, 0.90);
 
     safe_text_colored(0.85, 0.90, 1.0, 1.0, 'Search:');
     imgui.SameLine();
@@ -1052,17 +967,19 @@ local function render_spell_tracker_view(equipped_state, limits, learned_map, is
     pcall(function() imgui.Checkbox('Current Zone only##tr_zone', gui.filter_current_zone_only); end);
     safe_pop_style_color(1);
 
-    safe_pop_style_color(5); -- Pop FrameBg, FrameBgHovered, FrameBgActive, CheckMark, Border
+    safe_pop_style_color(5);
 
-    -- Ensure 'Learned only' and 'Unlearned only' are mutually exclusive to avoid accidental empty lists
     if not prev_l and gui.filter_learned_only[1] then
         gui.filter_unlearned_only[1] = false;
     elseif not prev_u and gui.filter_unlearned_only[1] then
         gui.filter_learned_only[1] = false;
     end
 
-    local cur_zone_name = (gui.override_zone_name ~= '' and gui.override_zone_name)
-        or (player_data and player_data.zone_name) or gui.cached_zone_name or '';
+    -- Current zone (by id) or manual override (/vanablu zone <name>)
+    local override = gui.override_zone_name ~= '' and gui.override_zone_name or nil;
+    local cur_zone_id = (player_data and player_data.zone_id) or gui.cached_zone_id or 0;
+    local cur_zone_name = override or tracker.zone_name(cur_zone_id ~= 0 and cur_zone_id or nil,
+        (player_data and player_data.zone_name) or gui.cached_zone_name or '');
     local filter_zone = (gui.filter_current_zone_only[1] == true);
 
     if filter_zone then
@@ -1078,107 +995,127 @@ local function render_spell_tracker_view(equipped_state, limits, learned_map, is
 
     local query = (gui.search_query[1] or ''):lower();
     local matched_count = 0;
+    local px, py = nil, nil; -- player position, read lazily once per frame if needed
 
-    for _, sp in ipairs(ordered_spells) do
-        local is_learned = (learned_map[sp.id] == true);
-        local matches_search = (query == '') or sp.name:lower():find(query, 1, true);
+    for _, e in ipairs(entries) do
+        local is_learned = (learned_map[e.id] == true);
+        local matches_search = (query == '') or e.name:lower():find(query, 1, true);
         local matches_learned = true;
-        if gui.filter_learned_only[1] and not is_learned then
-            matches_learned = false;
-        end
-        if gui.filter_unlearned_only[1] and is_learned then
-            matches_learned = false;
-        end
-        local matches_level = not gui.filter_my_level_only[1] or (sp.level <= limits.level);
-        local matches_zone = true;
-        if filter_zone then
-            matches_zone = is_spell_in_zone(sp, cur_zone_name);
-        end
+        if gui.filter_learned_only[1] and not is_learned then matches_learned = false; end
+        if gui.filter_unlearned_only[1] and is_learned then matches_learned = false; end
+        local matches_level = not gui.filter_my_level_only[1] or (e.level <= limits.level);
+        local matches_zone = (not filter_zone) or tracker.in_zone(e, cur_zone_id, override);
 
         if matches_search and matches_learned and matches_level and matches_zone then
             matched_count = matched_count + 1;
-            local header_label = is_learned and sp.tracker_header_learned or sp.tracker_header_unlearned;
+            local header_label = is_learned and e.header_learned or e.header_unlearned;
 
-            -- Distinguish learned vs unlearned visually with clear distinct colors (yellow for unlearned)
             if is_learned then
                 safe_push_style_color(ImGuiCol_Text or 0, 0.4, 1.0, 0.4, 1.0);
+            elseif e.status == 'unavailable' then
+                safe_push_style_color(ImGuiCol_Text or 0, 0.6, 0.6, 0.6, 1.0);
             else
                 safe_push_style_color(ImGuiCol_Text or 0, 1.0, 0.85, 0.2, 1.0);
             end
-
             local is_expanded = imgui.CollapsingHeader(header_label);
             safe_pop_style_color(1);
 
             if is_expanded then
                 imgui.Indent(14);
+                local sp = e.sp;
 
-                local hunt = hunting[sp.id] or { family = 'Unknown', stats = 'None', zones = {} };
-
-                -- Concise spell summary: Level, Set Cost, Element, Monster Family
-                safe_text_colored(0.95, 0.95, 0.95, 1.0, sp.tracker_summary);
-
-                -- Attributes / Stat Modifiers
-                safe_text_colored(0.9, 0.85, 0.4, 1.0, sp.tracker_attributes);
-
-                -- Job Traits granted by this spell
-                safe_text_colored(0.5, 0.85, 1.0, 1.0, sp.tracker_traits);
-
-                -- Skillchains
-                if sp.tracker_skillchain then
-                    safe_text_colored(0.8, 0.7, 1.0, 1.0, sp.tracker_skillchain);
+                if e.banner then
+                    safe_text_colored(1.0, 0.45, 0.35, 1.0, e.banner);
                 end
 
-                -- Additional Effects
-                if sp.tracker_effects then
-                    safe_text_colored(0.7, 0.95, 0.7, 1.0, sp.tracker_effects);
-                end
+                safe_text_colored(0.95, 0.95, 0.95, 1.0, e.summary);
 
-                -- Weakness triggers
-                if sp.tracker_procs then
-                    safe_text_colored(1.0, 0.7, 0.4, 1.0, sp.tracker_procs);
-                end
-
-                -- Action button: Equip or Unequip
-                local is_equipped = (equipped_state and equipped_state.map and (equipped_state.map[sp.id] ~= nil)) or false;
-                if is_equipped then
-                    safe_push_style_color(ImGuiCol_Button or 21, 0.7, 0.2, 0.2, 1.0);
-                    if safe_button('Unequip Spell##tr_act_' .. sp.id, 120, 22) then
-                        handle_spell_click(sp.id, equipped_state, limits, learned_map, is_main);
+                -- Skill requirement (server rule: skill >= cap for the spell's level - 29)
+                if e.skill then
+                    if my_skill then
+                        local ok = my_skill >= e.skill;
+                        local col = ok and { 0.4, 1.0, 0.4 } or { 1.0, 0.45, 0.45 };
+                        safe_text_colored(col[1], col[2], col[3], 1.0, string.format(
+                            'Blue Magic skill needed to learn: %d   (yours: %d%s)', e.skill, my_skill,
+                            ok and '' or ' - too low, gear bonuses count'));
+                    else
+                        safe_text_colored(0.85, 0.85, 0.85, 1.0, string.format('Blue Magic skill needed to learn: %d', e.skill));
                     end
-                    safe_pop_style_color(1);
-                elseif is_learned then
-                    safe_push_style_color(ImGuiCol_Button or 21, 0.2, 0.6, 0.2, 1.0);
-                    if safe_button('Equip Spell##tr_act_' .. sp.id, 120, 22) then
-                        handle_spell_click(sp.id, equipped_state, limits, learned_map, is_main);
-                    end
-                    safe_pop_style_color(1);
-                else
-                    safe_text_colored(1.0, 0.85, 0.2, 1.0, '(Spell is not yet learned - defeat mobs below to learn)');
                 end
 
-                -- Learning Locations: Collapsible menus for each zone
+                if e.attributes then safe_text_colored(0.9, 0.85, 0.4, 1.0, e.attributes); end
+                if sp then
+                    safe_text_colored(0.5, 0.85, 1.0, 1.0, sp.tracker_traits or 'Job Traits: None');
+                    if sp.tracker_skillchain then safe_text_colored(0.8, 0.7, 1.0, 1.0, sp.tracker_skillchain); end
+                    if sp.tracker_effects then safe_text_colored(0.7, 0.95, 0.7, 1.0, sp.tracker_effects); end
+                    if sp.tracker_procs then safe_text_colored(1.0, 0.7, 0.4, 1.0, sp.tracker_procs); end
+                end
+
+                for _, note in ipairs(e.notes) do
+                    safe_text_colored(1.0, 0.8, 0.35, 1.0, 'Note: ' .. note);
+                end
+                if e.extra_text then
+                    safe_text_disabled(e.extra_text);
+                end
+
+                -- Action button: Equip or Unequip (settable spells only)
+                if e.settable and sp then
+                    local is_equipped = (equipped_state and equipped_state.map and (equipped_state.map[e.id] ~= nil)) or false;
+                    if is_equipped then
+                        safe_push_style_color(ImGuiCol_Button or 21, 0.7, 0.2, 0.2, 1.0);
+                        if safe_button('Unequip Spell##tr_act_' .. e.id, 120, 22) then
+                            handle_spell_click(e.id, equipped_state, limits, learned_map, is_main);
+                        end
+                        safe_pop_style_color(1);
+                    elseif is_learned then
+                        safe_push_style_color(ImGuiCol_Button or 21, 0.2, 0.6, 0.2, 1.0);
+                        if safe_button('Equip Spell##tr_act_' .. e.id, 120, 22) then
+                            handle_spell_click(e.id, equipped_state, limits, learned_map, is_main);
+                        end
+                        safe_pop_style_color(1);
+                    end
+                end
+
                 imgui.Spacing();
-                safe_text_colored(0.4, 0.8, 1.0, 1.0, hunt.zones_header or 'Learning Locations:');
+                safe_text_colored(0.4, 0.8, 1.0, 1.0, e.zones_header);
                 imgui.Separator();
 
-                if not hunt.zones or #hunt.zones == 0 then
-                    safe_text_disabled('No hunting locations documented for this spell.');
+                if #e.zones == 0 then
+                    safe_text_disabled('No learning locations on this server.');
                 else
-                    for _, z_entry in ipairs(hunt.zones) do
-                        local is_this_zone = (cur_zone_name ~= '' and z_entry.zone and (z_entry.zone:lower() == cur_zone_name:lower()));
-                        if is_this_zone then
+                    for _, z in ipairs(e.zones) do
+                        local is_here = tracker.is_current(z, cur_zone_id, override);
+                        if is_here then
                             safe_push_style_color(ImGuiCol_Text or 0, 0.4, 0.95, 1.0, 1.0);
                         end
-                        local z_hdr = is_this_zone and (z_entry.header .. ' [CURRENT ZONE]') or z_entry.header;
-                        local z_expanded = imgui.CollapsingHeader(z_hdr);
-                        if is_this_zone then
+                        local z_expanded = imgui.CollapsingHeader(is_here and z.header_current or z.header);
+                        if is_here then
                             safe_pop_style_color(1);
                         end
 
                         if z_expanded then
                             imgui.Indent(14);
-                            for _, m in ipairs(z_entry.mobs) do
-                                safe_bullet_text(m.bullet_text or (m.name .. '  |  Level: ' .. m.level .. '  |  Map Coordinates: ' .. m.coords));
+                            if is_here and not override and not px then
+                                px, py = tracker.player_position();
+                            end
+                            for _, m in ipairs(z.mobs) do
+                                local text = m.text;
+                                if is_here and px then
+                                    local dist, dir = tracker.nearest(m, px, py);
+                                    if dist then
+                                        text = string.format('%s  |  nearest known spawn: ~%d yalms %s', text, math.floor(dist + 0.5), dir);
+                                    end
+                                end
+                                if m.conf == 'unverified' then
+                                    safe_push_style_color(ImGuiCol_Text or 0, 0.65, 0.65, 0.65, 1.0);
+                                    safe_bullet_text(text);
+                                    safe_pop_style_color(1);
+                                else
+                                    safe_bullet_text(text);
+                                end
+                            end
+                            if z.more then
+                                safe_text_disabled(string.format('...and %d more monster type%s in this zone.', z.more, z.more == 1 and '' or 's'));
                             end
                             imgui.Unindent(14);
                             imgui.Spacing();
@@ -1194,7 +1131,7 @@ local function render_spell_tracker_view(equipped_state, limits, learned_map, is
 
     if matched_count == 0 then
         if filter_zone and cur_zone_name ~= '' then
-            safe_text_disabled(string.format('No Blue Magic spells available to learn in "%s" matching active filters.', cur_zone_name));
+            safe_text_disabled(string.format('No Blue Magic spells can be learned in "%s" with the active filters.', cur_zone_name));
         else
             safe_text_disabled('No Blue Magic spells match the active tracker filter criteria.');
         end
@@ -1478,8 +1415,20 @@ local function render_help_view()
     safe_bullet_text('Click [-] or [X] on an equipped spell to remove it.');
     safe_bullet_text('Spell changes use the game client native memory routine with built-in cooldowns.');
     safe_bullet_text('If your client uses custom signatures, VanaBlu operates in Read-Only Reference Mode.');
-    safe_bullet_text('Spell Tracker tab: Collapsible list of all 178 learnable spells with learned status, traits, attributes, and mob learning zones with map coordinates.');
+    safe_bullet_text('Spell Tracker tab: every spell learnable on this server (including Unbridled Learning spells), with learned status and the monsters/zones that teach it.');
     safe_bullet_text('Saved Sets tab: Save and name custom spell configurations with one-click equip, update, and delete actions.');
+    safe_bullet_text('Saved sets are stored in Ashita\\config\\addons\\vanablu\\saved_sets.lua and are kept when the addon is updated.');
+
+    imgui.Spacing();
+    imgui.Text('Learning Blue Magic (server rules):');
+    safe_bullet_text('Blue Mage must be your MAIN job, alive, and in the same party/alliance as whoever claimed the monster.');
+    safe_bullet_text('The monster must actually finish using the move during the fight, and you must be nearby when it dies.');
+    safe_bullet_text('Your Blue Magic skill (gear bonuses count) must be within 29 of the skill cap for the spell\'s level.');
+    safe_bullet_text('Base chance is 33% per kill. Only one learning attempt is made per kill, even if the monster used several learnable moves.');
+    safe_bullet_text('No learning if someone called for help. If the monster regains full HP, the moves it used are forgotten.');
+    safe_bullet_text('"Too Weak" monsters can still teach spells (no experience requirement).');
+    safe_bullet_text('In the tracker, "nearest known spawn" shows the distance/direction to the closest spawn point while you are in that zone.');
+    safe_bullet_text('Entries marked "location from wiki" or "UNVERIFIED" are not confirmed for this server.');
 
     imgui.Spacing();
     imgui.Text('Job Traits & Gifts:');
@@ -1505,16 +1454,29 @@ local function render_equipped_sidebar(equipped_state, limits, learned_map, is_m
     imgui.Text(string.format('Set Points: %d / %d', equipped_state.points_spent, limits.points));
     safe_progress_bar(points_fraction, -1, 14);
 
-    if limits.is_main then
-        imgui.TextDisabled(string.format('Main Job Lv.%d (Assimilation: +%d BP)',
-            limits.level, limits.points - ((math.floor((limits.level + 9) / 10) * 5) + 5)));
+    local job_label = limits.is_main and 'Main Job' or 'Support Job';
+    if (limits.bonus_points or 0) > 0 then
+        imgui.TextDisabled(string.format('%s Lv.%d (+%d Bonus BP)', job_label, limits.level, limits.bonus_points));
     else
-        local bonus_bp = limits.points - ((math.floor((limits.level + 9) / 10) * 5) + 5);
-        if bonus_bp > 0 then
-            imgui.TextDisabled(string.format('Support Job Lv.%d (+%d Bonus BP)', limits.level, bonus_bp));
-        else
-            imgui.TextDisabled(string.format('Support Job Lv.%d', limits.level));
-        end
+        imgui.TextDisabled(string.format('%s Lv.%d', job_label, limits.level));
+    end
+    if imgui.IsItemHovered() then
+        local src = (limits.points_source == 'client') and 'read from the game client'
+            or 'calculated (game client value unavailable)';
+        pcall(function()
+            imgui.SetTooltip(string.format(
+                'Set Points: %d (%s)\nBase (level): %d\nAssimilation merits: +%d\nBlue Magic Point Bonus (JP): %s',
+                limits.points, src, limits.base_points or 0, limits.merit_points or 0,
+                backend.jp_bp_bonus and ('+' .. tostring(limits.jp_points or 0)) or 'not received yet'));
+        end);
+    end
+
+    -- If the game client's total is unavailable at Lv.99 and the job point rank has not been
+    -- received yet, the calculated maximum may be missing up to 20 BP. Tell the player how to fix it.
+    if limits.is_main and limits.level == 99 and limits.points_source ~= 'client'
+        and backend.jp_bp_bonus == nil and (limits.jp_spent or 0) > 0 then
+        safe_text_colored(1.0, 0.75, 0.3, 1.0, 'Set Points may be low: open the in-game');
+        safe_text_colored(1.0, 0.75, 0.3, 1.0, 'Job Points or Set Blue Magic menu once.');
     end
 
     imgui.Separator();
@@ -1694,20 +1656,23 @@ ashita.events.register('d3d_present', 'vanablu_present_cb', function()
         local cur_assim = player_data.assimilation or 0;
         local cur_bp = player_data.blue_point_bonus or 0;
         local cur_jp = player_data.jp_spent or 0;
+        local cur_client_max = player_data.client_max_points or 0;
 
         if not gui.cached_limits
             or gui.cached_lim_lvl ~= cur_lvl
             or gui.cached_lim_main ~= cur_main
             or gui.cached_lim_assim ~= cur_assim
             or gui.cached_lim_bp ~= cur_bp
-            or gui.cached_lim_jp ~= cur_jp then
+            or gui.cached_lim_jp ~= cur_jp
+            or gui.cached_lim_client_max ~= cur_client_max then
 
-            gui.cached_limits = model.get_limits(cur_lvl, cur_main, cur_assim, cur_bp, cur_jp);
+            gui.cached_limits = model.get_limits(cur_lvl, cur_main, cur_assim, cur_bp, cur_jp, cur_client_max);
             gui.cached_lim_lvl = cur_lvl;
             gui.cached_lim_main = cur_main;
             gui.cached_lim_assim = cur_assim;
             gui.cached_lim_bp = cur_bp;
             gui.cached_lim_jp = cur_jp;
+            gui.cached_lim_client_max = cur_client_max;
         end
         local limits = gui.cached_limits;
 
@@ -1735,13 +1700,14 @@ ashita.events.register('d3d_present', 'vanablu_present_cb', function()
         -- Cached learned spells query (invalidates every 2 seconds or on character level change)
         local now_clock = os.clock();
         if not gui.cached_learned_map or (now_clock - gui.last_learned_check > 2.0) or (player_data.level ~= gui.last_player_level) then
-            gui.cached_learned_map = backend.read_learned(player_data.player, spells);
+            -- Checks every tracker spell, including Unbridled Learning spells (a superset of res/spellinfo.lua)
+            gui.cached_learned_map = backend.read_learned(player_data.player, tracker.all_ids);
             gui.last_learned_check = now_clock;
             gui.last_player_level = player_data.level;
 
             local count = 0;
-            for _, sp in ipairs(ordered_spells) do
-                if gui.cached_learned_map[sp.id] == true then
+            for _, e in ipairs(tracker.entries) do
+                if gui.cached_learned_map[e.id] == true then
                     count = count + 1;
                 end
             end
@@ -1807,6 +1773,13 @@ ashita.events.register('d3d_present', 'vanablu_present_cb', function()
 end);
 
 -- =============================================================================
+-- Incoming Packets: capture BLU job point data (Blue Magic Point Bonus) from 0x08D
+-- =============================================================================
+ashita.events.register('packet_in', 'vanablu_packet_in_cb', function(e)
+    pcall(backend.handle_packet_in, e);
+end);
+
+-- =============================================================================
 -- Command Handling (Ashita v4 Standard)
 -- =============================================================================
 local function print_help()
@@ -1866,7 +1839,7 @@ ashita.events.register('command', 'vanablu_command_cb', function(e)
                             local p_data = nil;
                             pcall(function() p_data = backend.read(); end);
                             local is_m = p_data and p_data.is_main or true;
-                            local lim = model.get_limits(p_data and p_data.level or 1, is_m, p_data and p_data.assimilation, p_data and p_data.blue_point_bonus, p_data and p_data.jp_spent);
+                            local lim = model.get_limits(p_data and p_data.level or 1, is_m, p_data and p_data.assimilation, p_data and p_data.blue_point_bonus, p_data and p_data.jp_spent, p_data and p_data.client_max_points);
                             local eq_s = model.process_equipped(p_data and p_data.raw or {}, spells);
                             local l_map = gui.cached_learned_map or backend.read_learned(p_data and p_data.player, spells);
                             local valid_target = {};
@@ -1898,7 +1871,7 @@ ashita.events.register('command', 'vanablu_command_cb', function(e)
                         if eq_s.count == 0 then
                             print('[VanaBlu] Cannot save empty set. Equip spells first.');
                         else
-                            local lim = model.get_limits(p_data and p_data.level or 1, p_data and p_data.is_main, p_data and p_data.assimilation, p_data and p_data.blue_point_bonus, p_data and p_data.jp_spent);
+                            local lim = model.get_limits(p_data and p_data.level or 1, p_data and p_data.is_main, p_data and p_data.assimilation, p_data and p_data.blue_point_bonus, p_data and p_data.jp_spent, p_data and p_data.client_max_points);
                             local set_spells = {};
                             for slot = 1, lim.slots do
                                 local sp_id = eq_s.slots[slot];
@@ -1943,6 +1916,7 @@ ashita.events.register('command', 'vanablu_command_cb', function(e)
                     if count == 0 then
                         print('  (No sets saved yet)');
                     end
+                    print('  Stored in: ' .. tostring(setstore.db_path or 'unavailable'));
                 elseif sub == 'zone' then
                     if #args >= 3 then
                         local z_name = table.concat(args, ' ', 3);
@@ -2001,9 +1975,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 
 return {
-    is_spell_in_zone = is_spell_in_zone,
-    is_past_zone = is_past_zone,
-    clean_zone_base = clean_zone_base,
+    tracker = tracker,
     ordered_spells = ordered_spells,
     gui = gui,
 };

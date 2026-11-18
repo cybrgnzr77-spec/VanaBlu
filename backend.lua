@@ -64,10 +64,15 @@ local M = {
     last_equip_action_time = -100,
     equip_target_main      = true,
     equip_is_first_action  = false,
+
+    -- Blue Magic Point Bonus job point rank (0-20), learned from incoming packet 0x08D.
+    -- nil until the server has sent the player's job point details this session.
+    jp_bp_bonus            = nil,
 };
 
 local offset = nil;
 local setter = nil;
+local points_ptr = nil; -- Address of the client's BLU set point info pointer (see SIG_POINTS)
 
 -- Pre-allocated zero padding strings for slots 0..160 to avoid string.rep allocations during packet building
 local ZERO_PADS = {};
@@ -97,6 +102,8 @@ local state_snapshot = {
     player           = nil,
     zone_id          = 0,
     zone_name        = '',
+    client_max_points   = 0, -- Max BLU set points as computed by the game client (0 = unavailable)
+    client_spent_points = 0, -- Spent BLU set points as tracked by the game client
 };
 
 --- Internal helper to populate and return the reusable state snapshot table.
@@ -114,14 +121,22 @@ local function make_state(ready, is_blu, is_main, level, assim, bp_bonus, jp, ra
     state_snapshot.player           = player;
     state_snapshot.zone_id          = zone_id or 0;
     state_snapshot.zone_name        = zone_name or '';
+    state_snapshot.client_max_points   = 0;
+    state_snapshot.client_spent_points = 0;
     return state_snapshot;
 end
 
 -- Signature patterns for locating client routines:
 --   SIG_OFFSET: Locates the uint32 byte offset into the inventory structure for Blue Magic
 --   SIG_SETTER: Locates the client's internal native equipex routine
+--   SIG_POINTS: Locates the client's BLU set point info (max points at +0x18, spent at +0x14).
+--               Same signature/offset used by atom0s's official Ashita blusets addon (blu.lua).
 local SIG_OFFSET = 'C1E1032BC8B0018D????????????B9????????F3A55F5E5B';
 local SIG_SETTER = '8B0D????????81EC9C00000085C95356570F??????????8B';
+local SIG_POINTS = 'A1????????33C98A4E5E33D28A565D5F5E8950148948185B83C414C20400';
+
+-- Job point id for BLU "Blue Magic Point Bonus" (JPCATEGORY_BLU 0x200 + 0x01). +1 set point per rank, max 20.
+local JP_ID_BLUE_MAGIC_POINT_BONUS = 0x201;
 
 -- Job ID to name mapping for clear status reporting
 local JOB_NAMES = {
@@ -268,7 +283,67 @@ end
 -- Setting capabilities are universally enabled because packet 0x102 injection works on all clients.
 -- @return boolean Success status
 -- @return string  Descriptive status message
+--- Locates the client's BLU set point info pointer (independent of the other signatures).
+local function scan_points()
+    if points_ptr then return; end
+    local p = nil;
+    pcall(function() p = ashita.memory.find('FFXiMain.dll', 0, SIG_POINTS, 1, 0); end);
+    if not p or p == 0 then
+        pcall(function() p = ashita.memory.find(0, 0, SIG_POINTS, 1, 0); end);
+    end
+    if p and p ~= 0 then
+        points_ptr = p;
+    end
+end
+
+--- Reads the BLU set point totals the game client itself computes (the values shown in the
+--- in-game "Set Blue Magic" menu). These already include Assimilation merits and the
+--- Blue Magic Point Bonus job points, so they are the authoritative maximum.
+-- Pointer chain matches blusets: points[0][0][0x18] (max) and points[0][0][0x14] (spent).
+-- @return number|nil max set points, or nil if unavailable
+-- @return number|nil spent set points
+local function read_client_points()
+    if not points_ptr then return nil, nil; end
+    local max_pts, spent_pts = nil, nil;
+    pcall(function()
+        local global_addr = ashita.memory.read_uint32(points_ptr);
+        if not global_addr or global_addr == 0 then return; end
+        local info = ashita.memory.read_uint32(global_addr);
+        if not info or info == 0 then return; end
+        max_pts   = ashita.memory.read_uint8(info + 0x18);
+        spent_pts = ashita.memory.read_uint8(info + 0x14);
+    end);
+    if not max_pts or max_pts == 0 then
+        return nil, nil;
+    end
+    return max_pts, spent_pts;
+end
+
+--- Handles incoming packets. Captures the BLU "Blue Magic Point Bonus" job point rank from
+--- packet 0x08D (Job Point details). Each packet carries 64 four-byte entries starting at 0x04:
+--   uint16 id   (bits 0-4: index within job, bits 5-15: job id)  -> 0x201 for this job point
+--   uint16 info (bits 0-9: next cost, bits 10-15: current rank)
+-- The server sends these when the client requests job point info (login / Job Points menu).
+-- @param e table Ashita packet_in event
+function M.handle_packet_in(e)
+    if e.id ~= 0x08D then return; end
+    local data = e.data;
+    if type(data) ~= 'string' then return; end
+    for i = 0, 63 do
+        local off = 0x04 + (i * 4);
+        if off + 4 > #data then break; end
+        local id = struct.unpack('H', data, off + 1);
+        if id == JP_ID_BLUE_MAGIC_POINT_BONUS then
+            local info = struct.unpack('H', data, off + 3);
+            M.jp_bp_bonus = math.min(20, bit.rshift(info, 10));
+            return;
+        end
+    end
+end
+
 function M.init()
+    scan_points();
+
     if M.is_initialized and M.can_set and offset then
         return true, M.init_message;
     end
@@ -544,27 +619,36 @@ function M.read()
         end
     end);
 
+    -- Blue Magic Point Bonus (job points): Ashita v4 exposes no per-category job point API, so the
+    -- rank is captured from incoming packet 0x08D (see M.handle_packet_in). Main job only.
     local bp_bonus = 0;
     local jp = 0;
     pcall(function()
         if is_main and player.GetJobPointsSpent then
             jp = player:GetJobPointsSpent(16) or 0;
-            if player.GetBlueMagicPointBonus then
-                bp_bonus = player:GetBlueMagicPointBonus() or 0;
-            end
         end
     end);
+    if is_main and M.jp_bp_bonus then
+        bp_bonus = M.jp_bp_bonus;
+    end
+
+    -- Authoritative set point totals as computed by the game client (includes merits + job points)
+    local client_max, client_spent = read_client_points();
 
     -- Guard 5: Read raw equipped spell buffer (20 bytes) using blusets double-dereference method
     local raw, read_success = read_equipped_spells(player, is_sub);
 
+    local state;
     if not read_success then
-        return make_state(true, true, is_main, level, assim, bp_bonus, jp, raw, true,
+        state = make_state(true, true, is_main, level, assim, bp_bonus, jp, raw, true,
             'Equipped spells not cached yet. Open the in-game Blue Magic menu once to initialize.', player, current_zone_id, current_zone_name);
+    else
+        state = make_state(true, true, is_main, level, assim, bp_bonus, jp, raw, true,
+            'Ready', player, current_zone_id, current_zone_name);
     end
-
-    return make_state(true, true, is_main, level, assim, bp_bonus, jp, raw, true,
-        'Ready', player, current_zone_id, current_zone_name);
+    state.client_max_points   = client_max or 0;
+    state.client_spent_points = client_spent or 0;
+    return state;
 end
 
 --- Queries which Blue Magic spells the character has learned.

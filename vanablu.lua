@@ -21,7 +21,7 @@
 
 addon.name    = 'vanablu';
 addon.author  = 'Anissa (original bluGuide) / Ashita v4 port & VanaBlu enhancements';
-addon.version = '1.0.3';
+addon.version = '1.0.4';
 addon.desc    = 'Interactive Blue Magic spell, trait, skillchain, and hunting guide for Ashita v4.';
 addon.link    = 'https://github.com/Windower/Lua/tree/dev/addons/bluguide'; -- original bluGuide
 
@@ -46,6 +46,9 @@ local gui = {
     saved_sets            = {},
     saved_sets_dirty      = true,     -- Dirty flag to avoid re-sorting set names every frame
     sorted_set_names      = {},       -- Cached list of sorted set names
+    sets_version          = 0,        -- Bumped on every saved-set change (invalidates the "Set:" label)
+    loaded_set            = nil,      -- { name, spells } of the last set load the server confirmed
+    equip_skip_note       = nil,      -- Note about spells left out of the current set load
     cached_learned_map    = nil,      -- Cached map of learned spells to avoid ~10k calls/sec
     cached_learned_count  = 0,        -- Cached count of learned spells
     last_learned_check    = 0,        -- Timestamp of last memory scan for learned spells
@@ -158,6 +161,7 @@ end
 
 local function save_saved_sets(sets)
     gui.saved_sets_dirty = true;
+    gui.sets_version = gui.sets_version + 1;
     return setstore.save(sets);
 end
 
@@ -1213,7 +1217,11 @@ local function render_saved_sets_view(equipped_state, limits, learned_map, is_ma
 
     -- Show active set equipping banner if in progress
     if backend.is_equipping_set then
-        text_colored(COLOR.info, string.format('Equipping "%s"... (%d changes remaining)', backend.equip_set_name, #backend.equip_queue));
+        if backend.equip_phase == 'verifying' then
+            text_colored(COLOR.info, string.format('Checking "%s" against the server...', backend.equip_set_name));
+        else
+            text_colored(COLOR.info, string.format('Equipping "%s"... (%d spells remaining)', backend.equip_set_name, #backend.equip_queue));
+        end
         imgui.SameLine();
         if button('Cancel##cancel_equip_btn', 80, 20) then
             backend.cancel_equip();
@@ -1365,8 +1373,10 @@ local function render_saved_sets_view(equipped_state, limits, learned_map, is_ma
                                     set_status(string.format('Set "%s" is already equipped.', name), false);
                                 else
                                     local ok, msg = backend.start_equip_set(valid_target, name, is_main, equipped_state.slots);
+                                    gui.equip_skip_note = nil;
                                     if ok and skipped_count > 0 then
-                                        msg = string.format('%s (Skipped %d unlearned/over-level spells)', msg, skipped_count);
+                                        gui.equip_skip_note = string.format(' (Skipped %d unlearned/over-level spells)', skipped_count);
+                                        msg = msg .. gui.equip_skip_note;
                                     end
                                     set_status(msg, not ok);
                                 end
@@ -1477,7 +1487,8 @@ local function render_help_view()
     imgui.Text('How Setting Spells Works:');
     bullet_text('Click [+] next to any spell to set it in your first free spell slot.');
     bullet_text('Click [-] or [X] on an equipped spell to remove it.');
-    bullet_text('Spell changes are sent to the server one at a time, about 0.75 seconds apart.');
+    bullet_text('The server accepts one spell per change, so sets load one spell about every second.');
+    bullet_text('After loading a set, VanaBlu checks the server\'s spell list and retries any spell that did not take.');
     bullet_text('When Blue Mage is not your main or support job, VanaBlu is a read-only reference.');
     bullet_text('Spell Tracker tab: every spell learnable on this server (including Unbridled Learning spells), with learned status and the monsters/zones that teach it.');
     bullet_text('Saved Sets tab: Save and name custom spell configurations with one-click equip, update, and delete actions.');
@@ -1504,11 +1515,106 @@ local function render_help_view()
 end
 
 -- =============================================================================
+-- Saved Set Status: "Set:" label and set-load results
+-- =============================================================================
+
+--- True if `list` (spell ids) holds exactly the equipped spells, in any slot order.
+local function spells_match(list, equipped_state)
+    if type(list) ~= 'table' or #list ~= equipped_state.count then
+        return false;
+    end
+    for _, id in ipairs(list) do
+        if not equipped_state.map[id] then
+            return false;
+        end
+    end
+    return true;
+end
+
+-- The label only changes when the equipped spells, the saved sets or the last loaded set change,
+-- so it is rebuilt only then (equipped_state is a new table whenever the spells change).
+local set_label_cache = { state = nil, version = -1, loaded = nil, label = 'Set: none' };
+
+--- Returns the sidebar's "Set: ..." text: the saved set whose spells are exactly the equipped ones,
+--- or "none". The set loaded last wins if several saved sets hold the same spells.
+local function current_set_label(equipped_state)
+    if backend.is_equipping_set then
+        return 'Set: ' .. backend.equip_set_name .. ' (loading...)';
+    end
+
+    local cache = set_label_cache;
+    if cache.state == equipped_state and cache.version == gui.sets_version and cache.loaded == gui.loaded_set then
+        return cache.label;
+    end
+
+    local name = nil;
+    if equipped_state.count > 0 then
+        local loaded = gui.loaded_set;
+        if loaded and gui.saved_sets[loaded.name] and spells_match(loaded.spells, equipped_state) then
+            name = loaded.name;
+        else
+            local names = {};
+            for set_name in pairs(gui.saved_sets) do
+                names[#names + 1] = set_name;
+            end
+            table.sort(names);
+            for _, set_name in ipairs(names) do
+                if spells_match(gui.saved_sets[set_name].spells, equipped_state) then
+                    name = set_name;
+                    break;
+                end
+            end
+        end
+    end
+
+    cache.state, cache.version, cache.loaded = equipped_state, gui.sets_version, gui.loaded_set;
+    cache.label = 'Set: ' .. (name or 'none');
+    return cache.label;
+end
+
+--- Shows a set-load status message from backend.tick_equip_queue. When the load has finished it also
+--- names any spells that could not be set, remembers a confirmed set for the "Set:" label, and echoes
+--- the result to the chat log if the window is closed (e.g. a load started with /vb set).
+local function report_equip_progress(finished, msg, is_err, failed)
+    if failed and #failed > 0 then
+        local names = {};
+        for _, id in ipairs(failed) do
+            names[#names + 1] = spells[id] and spells[id].name or ('#' .. id);
+        end
+        msg = string.format('%s Not set: %s. Check that they are learned and that you have enough set points.',
+            msg, table.concat(names, ', '));
+    end
+
+    if finished then
+        if gui.equip_skip_note then
+            msg = msg .. gui.equip_skip_note;
+            gui.equip_skip_note = nil;
+        end
+        if not is_err then
+            local confirmed = {};
+            for slot = 1, 20 do
+                local id = backend.equip_target[slot];
+                if id and id > 0 then confirmed[#confirmed + 1] = id; end
+            end
+            gui.loaded_set = { name = backend.equip_set_name, spells = confirmed };
+        end
+        if not gui.is_open[1] then
+            print('[VanaBlu] ' .. msg);
+        end
+    end
+
+    set_status(msg, is_err);
+end
+
+-- =============================================================================
 -- Left Sidebar: Equipped Spells & Capacity Meters
 -- =============================================================================
 local function render_equipped_sidebar(equipped_state, limits, learned_map, is_main)
     text_colored(COLOR.title, 'Equipped Blue Magic');
     imgui.Separator();
+
+    -- Currently equipped saved set
+    imgui.Text(current_set_label(equipped_state));
 
     -- Capacity meters
     local slot_fraction = limits.slots > 0 and (equipped_state.count / limits.slots) or 0;
@@ -1684,9 +1790,9 @@ ashita.events.register('d3d_present', 'vanablu_present_cb', function()
         end
 
         if backend.is_equipping_set then
-            local finished, msg = backend.tick_equip_queue(is_m);
-            if finished and msg then
-                set_status(msg, false);
+            local finished, msg, is_err, failed = backend.tick_equip_queue(is_m);
+            if msg then
+                report_equip_progress(finished, msg, is_err, failed);
             end
         end
     end
@@ -1928,6 +2034,7 @@ ashita.events.register('command', 'vanablu_command_cb', function(e)
                             if #diff == 0 then
                                 print(string.format('[VanaBlu] Set "%s" is already equipped.', matched_set.name));
                             else
+                                gui.equip_skip_note = nil;
                                 local ok, msg = backend.start_equip_set(valid_target, matched_set.name, is_m, eq_s.slots);
                                 print('[VanaBlu] ' .. (msg or 'Equipping set...'));
                             end

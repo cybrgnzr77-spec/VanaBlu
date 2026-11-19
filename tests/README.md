@@ -21,6 +21,7 @@ texlua tests/test_audit.lua .
 | `test_sets.lua` | Saved set storage in the config folder, migration from older versions |
 | `test_spelldata.lua` | Spell and trait data checks, every tab renders without errors |
 | `test_tracker.lua` | Spell Tracker data, zone matching, nearest spawn |
+| `test_equip.lua` | Saved-set loading against a simulated server: pacing, 0x044 confirmation, retries, dropped packets, the "Set:" label |
 | `test_audit.lua` | v1.0.3 fixes: ImGui Begin/End pairing, support-job flag, packet bytes, per-frame lookups, trait cache |
 
 `bench_frames.lua` is not a test: it prints memory allocated and time spent per rendered frame for each tab

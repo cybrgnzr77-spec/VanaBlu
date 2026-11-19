@@ -17,7 +17,9 @@
 *     "fast" mode and, when its signature is found, also calls the client's own
 *     setter function (blusets' "safe" mode).
 *   - Pacing: single spell changes are throttled to one every 0.75s; set loads
-*     wait 1.25s after the clear packet, then send one spell every 0.75s.
+*     wait 1.5s after the clear packet, then send one spell every 1.0s.
+*   - Set loads are confirmed against the server's spell list (incoming packet
+*     0x044) and missing spells are retried (see tick_equip_queue).
 *   - read() reuses one state table and one 20-byte buffer, so polling it every
 *     frame does not allocate tables.
 *
@@ -38,9 +40,12 @@ local M = {
     can_set                = true, -- Spell changes are always attempted (packets need no signature)
     init_message           = 'Backend not initialized',
     last_write_time        = -100,
-    write_cooldown         = 0.75, -- Safe inter-spell equip throttle (0.75s) to absorb network/server jitter
-    unset_cooldown         = 0.75, -- Safe inter-slot unset delay (0.75s)
-    post_reset_delay       = 1.25, -- Settle delay (1.25s) after batch reset packet before equipping first spell
+    write_cooldown         = 0.75, -- Minimum time between single spell changes (clicks in the window)
+    unset_cooldown         = 0.75, -- Time between per-slot unsets after a clear-all
+    set_spell_interval     = 1.0,  -- Time between spells while loading a saved set
+    post_reset_delay       = 1.5,  -- Wait after a clear-all packet before setting the first spell
+    verify_delay           = 1.5,  -- Wait after the last spell before checking the server's spell list
+    max_equip_retries      = 2,    -- Extra rounds for spells the server did not set
     is_unsetting           = false,
     unset_queue            = {},
     last_unset_time        = -100,
@@ -52,6 +57,16 @@ local M = {
     last_equip_action_time = -100,
     equip_target_main      = true,
     equip_is_first_action  = false,
+    equip_phase            = '',    -- 'setting' or 'verifying' while is_equipping_set
+    equip_target           = {},    -- [slot 1..20] = spell id the set should end with (0 = empty)
+    equip_retries          = 0,     -- retry rounds used so far
+    equip_retried_spells   = 0,     -- spells re-sent by retry rounds
+    equip_started_at       = -100,  -- os.clock() when the current set load started
+
+    -- Latest spell list confirmed by the server (incoming packet 0x044), per job slot.
+    -- server_spells.main / .sub = { 20 spell bytes }; server_spells_time.* = os.clock() of arrival.
+    server_spells          = { main = nil, sub = nil },
+    server_spells_time     = { main = -100, sub = -100 },
 
     -- true while Blue Mage is the main or support job (updated by read()). Spell changes are refused
     -- otherwise, since the server ignores Blue Magic packets from other jobs.
@@ -247,15 +262,30 @@ local function read_client_points()
 end
 
 --- Handles incoming packets. Captures the BLU "Blue Magic Point Bonus" job point rank from
---- packet 0x08D (Job Point details). Each packet carries 64 four-byte entries starting at 0x04:
+--- packet 0x044 (extended job data) for BLU, and the Blue Magic Point Bonus rank from
+--- packet 0x08D (Job Point details). Each 0x08D packet carries 64 four-byte entries starting at 0x04:
 --   uint16 id   (bits 0-4: index within job, bits 5-15: job id)  -> 0x201 for this job point
 --   uint16 info (bits 0-9: next cost, bits 10-15: current rank)
 -- The server sends these when the client requests job point info (login / Job Points menu).
+-- 0x044 (BLU): 0x04 Job (0x10), 0x05 IsSubJob, 0x08 SetSpells[20]. The server sends it after every
+-- Blue Magic set/unset it processes, so it is the authoritative list of set spells.
 -- @param e table Ashita packet_in event
 function M.handle_packet_in(e)
-    if e.id ~= 0x08D then return; end
     local data = e.data;
     if type(data) ~= 'string' then return; end
+
+    if e.id == 0x044 then
+        if #data >= 0x1C and data:byte(5) == 0x10 then
+            local key = (data:byte(6) == 0) and 'main' or 'sub';
+            local list = M.server_spells[key] or {};
+            for i = 1, 20 do list[i] = data:byte(8 + i); end
+            M.server_spells[key] = list;
+            M.server_spells_time[key] = os.clock();
+        end
+        return;
+    end
+
+    if e.id ~= 0x08D then return; end
     for i = 0, 63 do
         local off = 0x04 + (i * 4);
         if off + 4 > #data then break; end
@@ -617,8 +647,11 @@ end
 --- Starts equipping a saved set.
 -- 1. Sends one clear-all packet listing the equipped spells, so set spells can't collide with
 --    spells already in other slots or exceed the set point limit while loading.
--- 2. Waits post_reset_delay (1.25s) for the server to process it before the first spell.
--- 3. Queues one set per spell into slots 1..N; tick_equip_queue() sends one every write_cooldown (0.75s).
+-- 2. Waits post_reset_delay (1.5s) for the server to process it before the first spell.
+-- 3. Queues one set per spell into slots 1..N; tick_equip_queue() sends one every set_spell_interval (1.0s).
+--    The server accepts only one spell per set packet, so a set can't be sent in one packet.
+-- 4. Checks the result against the server's spell list and retries any spell that didn't take
+--    (see tick_equip_queue).
 -- Returns false without doing anything if the set is already equipped in the same slots.
 -- @param target_spells table array of spell IDs to equip (1-indexed)
 -- @param set_name string name of the set being equipped
@@ -664,7 +697,7 @@ function M.start_equip_set(target_spells, set_name, is_main, equipped_slots)
     local is_sub = (is_main == false);
     M.equip_target_main = (is_main ~= false);
 
-    -- 1. Clear-all packet (plus the same client setter calls as unset_all)
+    -- 1. Clear-all packet
     local raw_spells = {};
     if type(equipped_slots) == 'table' then
         for i = 1, 20 do
@@ -675,30 +708,28 @@ function M.start_equip_set(target_spells, set_name, is_main, equipped_slots)
     end
     dispatch_packet(0x102, build_reset_all_packet(raw_spells, is_sub));
 
-    if setter then
-        local main_flag = is_sub and 1 or 0;
-        pcall(setter, main_flag, 0x1000, 0xFF, 0);
-        pcall(setter, main_flag, 0x1000, 20, 0);
-    end
-
     -- 2. Queue setting each spell in target_spells into its slot sequentially
     M.equip_queue = {};
-    for slot = 1, math.min(#target_spells, 20) do
-        local sp_id = target_spells[slot];
-        if sp_id and sp_id > 0 then
-            table.insert(M.equip_queue, {
-                slot = slot,
-                spell_id = sp_id,
-                spell_byte = sp_id - 512,
-            });
+    M.equip_target = {};
+    for slot = 1, 20 do
+        local sp_id = (slot <= #target_spells) and target_spells[slot] or 0;
+        if not sp_id or sp_id <= 512 then sp_id = 0; end
+        M.equip_target[slot] = sp_id;
+        if sp_id > 0 then
+            table.insert(M.equip_queue, { slot = slot, spell_id = sp_id, spell_byte = sp_id - 512 });
         end
     end
 
+    local now = os.clock();
     M.is_equipping_set = true;
+    M.equip_phase = 'setting';
     M.equip_set_name = set_name or 'Saved Set';
     M.equip_total_actions = #M.equip_queue;
+    M.equip_retries = 0;
+    M.equip_retried_spells = 0;
+    M.equip_started_at = now;
     M.equip_is_first_action = true;
-    M.last_equip_action_time = os.clock(); -- Batch reset packet just fired; first spell equips after post_reset_delay (1.25s)
+    M.last_equip_action_time = now; -- clear-all just sent; first spell goes out after post_reset_delay
 
     return true, string.format('Equipping "%s" (%d spells)...', M.equip_set_name, #M.equip_queue);
 end
@@ -706,57 +737,140 @@ end
 --- Cancels an active set-equipping sequence.
 function M.cancel_equip()
     M.is_equipping_set = false;
+    M.equip_phase = '';
     M.equip_queue = {};
     return true, 'Equip operation cancelled.';
 end
 
+--- Returns the current set spells (20 bytes) for the job slot being equipped.
+-- Uses the server's latest 0x044 list when one arrived after the set load started (the clear-all
+-- packet always produces one). Otherwise falls back to the client's memory buffer.
+local function confirmed_spells(is_sub)
+    local key = is_sub and 'sub' or 'main';
+    local list = M.server_spells[key];
+    if list and M.server_spells_time[key] >= M.equip_started_at then
+        return list, 'server';
+    end
+    local raw, ok = read_equipped_spells(is_sub);
+    return ok and raw or nil, 'memory';
+end
+
+--- Compares the confirmed spells with equip_target and queues a retry round for the differences.
+-- Slots holding the wrong spell are cleared with one clear packet first (a target spell sitting in the
+-- wrong slot would otherwise block setting it). Returns the list of spell ids not in their slot.
+local function queue_retry(current)
+    local missing = {};
+    local clear = {};
+    local any_clear = false;
+    for slot = 1, 20 do
+        local want = M.equip_target[slot] or 0;
+        local have = current[slot] or 0;
+        local want_byte = (want > 0) and (want - 512) or 0;
+        clear[slot] = 0;
+        if have ~= want_byte then
+            if have ~= 0 then
+                clear[slot] = have;
+                any_clear = true;
+            end
+            if want > 0 then
+                missing[#missing + 1] = { slot = slot, spell_id = want, spell_byte = want_byte };
+            end
+        end
+    end
+    return missing, any_clear and clear or nil;
+end
+
 --- Services the set-equipping queue; called every frame from d3d_present.
--- Waits post_reset_delay (1.25s) before the first spell, then write_cooldown (0.75s) between spells.
+-- Setting: waits post_reset_delay (1.5s) after a clear packet, then sends one spell every
+-- set_spell_interval (1.0s). Verifying: verify_delay (1.5s) after the last spell, compares the
+-- server's spell list with the set. Differences get up to max_equip_retries extra rounds.
 -- @param is_main boolean|nil BLU main (true) / support (false); nil keeps the job start_equip_set() started with
--- @return boolean True if finished
--- @return string Status message if state changed
+-- @return boolean true when the load has finished (successfully or not)
+-- @return string|nil status message (also returned while a retry starts)
+-- @return boolean true if the message is an error
+-- @return table|nil spell ids that could not be set (only when finished with failures)
 function M.tick_equip_queue(is_main)
     if not M.is_equipping_set then
         return false, nil;
     end
 
-    if #M.equip_queue == 0 then
-        M.is_equipping_set = false;
-        return true, string.format('Successfully equipped set "%s"!', M.equip_set_name);
-    end
-
+    if is_main == nil then is_main = M.equip_target_main; end
+    local is_sub = (is_main == false);
     local now = os.clock();
-    local action_delay = M.equip_is_first_action and (M.post_reset_delay or 1.25) or (M.write_cooldown or 0.75);
 
-    if (now - M.last_equip_action_time) < action_delay then
+    -- Setting phase: send the next spell when its delay has passed
+    if #M.equip_queue > 0 then
+        local action_delay = M.equip_is_first_action and M.post_reset_delay or M.set_spell_interval;
+        if (now - M.last_equip_action_time) < action_delay then
+            return false, nil;
+        end
+        M.equip_is_first_action = false;
+
+        local action = table.remove(M.equip_queue, 1);
+        dispatch_packet(0x102, build_set_packet(action.spell_id, action.slot, is_sub));
+        if setter then
+            pcall(setter, is_sub and 1 or 0, 0x1000, action.slot - 1, action.spell_byte);
+        end
+        M.last_equip_action_time = now;
+        M.last_write_time = now;
+        if #M.equip_queue == 0 then
+            M.equip_phase = 'verifying';
+        end
         return false, nil;
     end
 
-    M.equip_is_first_action = false;
-
-    local action = table.remove(M.equip_queue, 1);
-    if is_main == nil then is_main = M.equip_target_main; end
-    local is_sub = (is_main == false);
-    local slot = action.slot;
-    local spell_byte = action.spell_byte;
-
-    -- Set packet for this slot, plus the client setter call
-    dispatch_packet(0x102, build_set_packet(action.spell_id, slot, is_sub));
-
-    if setter then
-        local main_flag = is_sub and 1 or 0;
-        pcall(setter, main_flag, 0x1000, slot - 1, spell_byte);
+    -- Verifying phase: give the server time to answer the last spell, then compare
+    M.equip_phase = 'verifying';
+    if (now - M.last_equip_action_time) < M.verify_delay then
+        return false, nil;
     end
 
-    M.last_equip_action_time = now;
-    M.last_write_time = now;
-
-    if #M.equip_queue == 0 then
+    local current = confirmed_spells(is_sub);
+    if not current then
         M.is_equipping_set = false;
-        return true, string.format('Successfully equipped set "%s"!', M.equip_set_name);
+        M.equip_phase = '';
+        return true, string.format('Sent set "%s", but the equipped spells could not be read to confirm it.', M.equip_set_name), true;
     end
 
-    return false, nil;
+    local missing, clear = queue_retry(current);
+    if #missing == 0 and not clear then
+        M.is_equipping_set = false;
+        M.equip_phase = '';
+        local note = '';
+        if M.equip_retried_spells > 0 then
+            note = string.format(' (%d spell%s needed a retry)', M.equip_retried_spells, M.equip_retried_spells == 1 and '' or 's');
+        end
+        return true, string.format('Equipped set "%s": all %d spells confirmed%s.', M.equip_set_name, M.equip_total_actions, note), false;
+    end
+
+    if M.equip_retries < M.max_equip_retries then
+        M.equip_retries = M.equip_retries + 1;
+        M.equip_retried_spells = M.equip_retried_spells + #missing;
+        M.equip_queue = missing;
+        M.equip_phase = 'setting';
+        if clear then
+            dispatch_packet(0x102, build_reset_all_packet(clear, is_sub));
+            M.equip_is_first_action = true;   -- wait post_reset_delay after the clear packet
+        else
+            M.equip_is_first_action = false;  -- next spell after set_spell_interval
+        end
+        M.last_equip_action_time = now;
+        return false, string.format('Set "%s": %d spell%s didn\'t take, retrying (%d/%d)...',
+            M.equip_set_name, #missing, #missing == 1 and '' or 's', M.equip_retries, M.max_equip_retries), false;
+    end
+
+    -- Out of retries: report what is still wrong
+    M.is_equipping_set = false;
+    M.equip_phase = '';
+    local failed = {};
+    for _, m in ipairs(missing) do failed[#failed + 1] = m.spell_id; end
+    local msg;
+    if #failed > 0 then
+        msg = string.format('Set "%s" is incomplete: %d spell%s could not be set.', M.equip_set_name, #failed, #failed == 1 and '' or 's');
+    else
+        msg = string.format('Set "%s" was set, but extra spells remain equipped.', M.equip_set_name);
+    end
+    return true, msg, true, failed;
 end
 
 return M;

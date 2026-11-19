@@ -4,7 +4,7 @@
 cd "$(dirname "$0")/.." || exit 1
 status=0
 for t in tests/test_*.lua; do
-    rm -rf /tmp/vbspd /tmp/vbtrk /tmp/vbtest /tmp/vbaudit
+    rm -rf /tmp/vbspd /tmp/vbtrk /tmp/vbtest /tmp/vbaudit /tmp/vbequip
     printf '%-28s ' "$t"
     out=$(texlua "$t" . 2>&1)
     rc=$?

@@ -1,4 +1,4 @@
-# VanaBlu for Ashita v4 (v1.0.3)
+# VanaBlu for Ashita v4 (v1.0.4)
 
 **VanaBlu** is an interactive Blue Magic spell, job trait, skillchain, and spell-hunting guide for Final Fantasy XI, built for **Ashita v4** and the VanaDreams (LandSandBoat) server, but I see no reason why it wouldn't work on retail or other servers.
 
@@ -14,7 +14,9 @@ VanaBlu is 100% vibe-coded by Gemini/Claude. I fully admit it. I wanted BluGuide
   - Click a spell to set or remove it. Each change sends a Blue Magic set packet (`0x102`) and, when found, also calls the game client's own setter function. Memory signatures, offsets and the packet layout follow atom0s's `blusets` addon that ships with Ashita v4.
   - Works for Blue Mage as main or support job. On any other job VanaBlu is a read-only reference.
 - **Saved sets**:
-  - Loading a set first clears all slots with one packet, waits **1.25 seconds**, then sets one spell every **0.75 seconds** (a 10-spell set takes about 8 seconds).
+  - Loading a set first clears all slots with one packet, waits **1.5 seconds**, then sets one spell every **1 second** (a 10-spell set takes about 12 seconds including the check). The server accepts only one spell per packet, so a set can't be sent all at once.
+  - When the last spell is sent, VanaBlu checks the server's own list of set spells and retries any spell that didn't take (up to 2 extra rounds). If a spell still can't be set, it tells you which one.
+  - The sidebar shows which saved set is equipped (`Set: <name>`), or `Set: none`.
 - **Equipped spell display**:
   - Reads the equipped spells from the same client memory location as `blusets` (`+0x04` main BLU, `+0xA0` support BLU).
 - **Audited spell data** (178 settable spells):
@@ -47,6 +49,12 @@ VanaBlu is 100% vibe-coded by Gemini/Claude. I fully admit it. I wanted BluGuide
 ---
 
 ## Changelog
+
+### v1.0.4
+- **Saved sets are confirmed.** After loading a set, VanaBlu compares it with the spell list the server sends back after every change and retries any spell that didn't take, up to 2 extra rounds. The result says whether every spell was confirmed, how many needed a retry, or which spells could not be set. If the window is closed (for example with `/vb set`), the result also goes to the chat log.
+- **Slower set loading:** 1 second between spells (was 0.75s) and 1.5 seconds after clearing (was 1.25s). A server can limit how often it accepts spell changes; sending too fast can make it drop one.
+- **New "Set:" line** above "Slots:" in the sidebar: the saved set whose spells are equipped (in any slot order), or "none".
+- Loading a set no longer calls the game client's spell setter with two out-of-range slot numbers (0xFF and 20), whose effect was unknown.
 
 ### v1.0.3
 Code audit for efficiency and comment accuracy:
@@ -177,15 +185,20 @@ VanaBlu builds its packets with the same layout as atom0s's `blusets` (164 bytes
   │
   ├── 1. Sends one packet that clears every equipped slot
   │
-  ├── 2. Waits 1.25s for the server to process it
+  ├── 2. Waits 1.5s for the server to process it
   │
   ├── 3. Equips Spell 1 into Slot 1
-  │      └── Waits 0.75s pacing delay
+  │      └── Waits 1.0s
   │
   ├── 4. Equips Spell 2 into Slot 2
-  │      └── Waits 0.75s pacing delay
+  │      └── Waits 1.0s
   │
-  └── ... Continues sequentially until complete (Set complete in ~8 seconds)
+  ├── ... Continues one spell at a time
+  │
+  ├── 5. Waits 1.5s, then compares the set with the server's spell list (packet 0x044)
+  │
+  └── 6. Anything missing or extra: clears wrong slots, re-sends missing spells, checks again
+         (up to 2 retry rounds), then reports the result
 ```
 
 ---

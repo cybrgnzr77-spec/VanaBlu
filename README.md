@@ -1,10 +1,12 @@
 # VanaBlu for Ashita v4 (v1.0.4)
 
+[Downloads](https://github.com/cybrgnzr77-spec/VanaBlu/releases)
+
 **VanaBlu** is an interactive Blue Magic spell, job trait, skillchain, and spell-hunting guide for Final Fantasy XI, built for **Ashita v4** and the VanaDreams (LandSandBoat) server, but I see no reason why it wouldn't work on retail or other servers.
 
 Evolved from the original Windower 4 `bluGuide` addon by **Anissa**, VanaBlu adds Dear ImGui rendering, spell setting with Blue Magic set packets (`0x102`), saved sets, and spell data checked against the LandSandBoat server code and retail data for all 178 settable Blue Magic spells.
 
-VanaBlu is 100% vibe-coded by Gemini/Claude. I fully admit it. I wanted BluGuide for myself and didn't have the skill to do it. Nobody else was doing it, so here we are.
+VanaBlu is 100% vibe-coded by Gemini/Claude. I fully admit it. I wanted BluGuide for myself and didn't have the skill to do it. Nobody else was doing it, so here we are…
 
 ---
 
@@ -240,4 +242,4 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 - **Original bluGuide Author**: Anissa of Cerberus
 - **Memory signatures, offsets and packet layout**: from atom0s's [blusets](https://github.com/AshitaXI/ashita-v4beta/tree/main/addons/blusets) addon (Ashita Development Team, GPLv3). VanaBlu does not copy blusets code; it reuses these client addresses and the packet format.
-- **Ashita v4 Native Port & VanaBlu Enhancements**: Assistant
+- **Ashita v4 Native Port & VanaBlu Enhancements**: Claude and Gemini
